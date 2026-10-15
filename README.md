@@ -47,7 +47,7 @@ The dashboard button *Exportar XLSX (filtro atual)* exports the filtered rows of
 
 | Option | Default | Description |
 |---|---|---|
-| `--source mongo|mysql|api` | `mongo` | `mongo` reads the monthly collections in MongoDB (`--mongo-uri`, default `mongodb://10.30.132.30:27017/?directConnection=true` or env `MONGO_URI`; `--mongo-db`, default `ami`; `--collections a,b` overrides the list). `mysql` reads `ops_auto_register_yyyyMM` tables in schema `ami` (`--db`, `--tables`). `api` uses the screen's endpoint (`/ami/collection/V1/register/result`), one PowerShell request per meter page – much slower. |
+| `--source mongo|mysql|api` | `mongo` | `mongo` reads the monthly collections in MongoDB (no credentials, `directConnection`, reads on secondary; by default it tries `10.30.104.31:27017` (primary, the one reachable from the CEMIG-side machines) then `10.30.132.30:27017` (secondary); `--mongo-uri` or env `MONGO_URI` pins one; `--mongo-db`, default `ami`; `--collections a,b` overrides the list). `mysql` reads `ops_auto_register_yyyyMM` tables in schema `ami` (`--db`, `--tables`). `api` uses the screen's endpoint (`/ami/collection/V1/register/result`), one PowerShell request per meter page – much slower. |
 | `--meters mysql|api|file` | `mysql` | Meter list: `archive_meter` in the AMI schema (default, no login), MDC `/ami/archives/V1/meters` (same as `cemig-ext-data/fetch-meters-mdc.js`, logs in), or a text file (`--meters-file list.txt`, one meter per line). Cached in `state/meters.jsonl`. |
 | `--batch N` | 200 | Meters per batch (one query round per batch) / checkpoint. |
 | `--limit N` | – | Analyse at most N meters in this run (useful for a first test: `--limit 1000`). |

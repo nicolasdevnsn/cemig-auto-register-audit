@@ -70,7 +70,7 @@ async function cmdRun(args) {
   progress.schema = schema; progress.category = progress.category ?? category; progress.runs++; delete progress.finishedAt;
 
   const db = source === 'mysql' ? A.mysqlSession(schema) : null;
-  const mongo = source === 'mongo' ? await A.mongoSession(args['mongo-uri'] || A.DEFAULT_MONGO_URI, args['mongo-db'] || A.DEFAULT_MONGO_DB) : null;
+  const mongo = source === 'mongo' ? await A.mongoSession(args['mongo-uri'] || null, args['mongo-db'] || A.DEFAULT_MONGO_DB) : null;
   const t0 = Date.now(); let batchesThisRun = 0; let rowsThisRun = 0;
   try {
     // ops_auto_register is split into monthly physical collections/tables (ops_auto_register_yyyyMM); the list is

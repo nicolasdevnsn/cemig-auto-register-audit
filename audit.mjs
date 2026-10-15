@@ -96,8 +96,12 @@ const DEFAULT_AMI_SCHEMA = 'ami';
 
 // Where the screen's rows really live: MongoDB (db `ami`), monthly collections ops_auto_register_yyyyMM,
 // per the split registry db_split_table_def_n (its consumers all go through mongoTemplate).
-const DEFAULT_MONGO_URI = process.env.MONGO_URI || 'mongodb://10.30.132.30:27017/?directConnection=true';
+// CEMIG Mongo replica set: 10.30.104.31 (primary, same subnet as the MySQL server, reachable from nansenu01) and
+// 10.30.132.30 (secondary; what Projects/mongodb-loadprofile-jump used). No credentials; direct connection; secondaryPreferred reads.
+const DEFAULT_MONGO_HOSTS = ['10.30.104.31:27017', '10.30.132.30:27017'];   // primary first: it is the one reachable from the CEMIG-side machines (confirmed 2026-10-15)
 const DEFAULT_MONGO_DB = process.env.MONGO_DB || 'ami';
+const DEFAULT_MONGO_URI = process.env.MONGO_URI || `mongodb://${DEFAULT_MONGO_HOSTS[0]}/${DEFAULT_MONGO_DB}?directConnection=true`;
+const MONGO_CLIENT_OPTIONS = { directConnection: true, readPreference: 'secondaryPreferred', serverSelectionTimeoutMS: 20000 };
 
 const DEFAULTS = {
   source: 'mongo',
@@ -383,12 +387,32 @@ async function fetchRecordsMysql(db, meterNos, tables) {
 }
 
 // ───────────────────────────────────────────────────────────── register records (MongoDB — the real source)
-async function mongoSession(uri = DEFAULT_MONGO_URI, dbName = DEFAULT_MONGO_DB) {
-  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 20000 });
-  await client.connect();
-  const db = client.db(dbName);
-  log(`mongo: connected to ${uri.replace(/\/\/[^@]*@/, '//***@')} db ${dbName}`);
-  return { client, db, dbName, async close() { try { await client.close(); } catch { /* ignore */ } } };
+/**
+ * Opens the CEMIG Mongo. With no explicit --mongo-uri / MONGO_URI it tries each default host in turn
+ * (primary first, then secondary) so a machine that only routes to one subnet still gets through.
+ */
+async function mongoSession(uri = null, dbName = DEFAULT_MONGO_DB) {
+  const explicit = uri || process.env.MONGO_URI || null;
+  const candidates = explicit ? [explicit] : DEFAULT_MONGO_HOSTS.map((h) => `mongodb://${h}/${dbName}?directConnection=true`);
+  const failures = [];
+  for (const cand of candidates) {
+    const masked = cand.replace(/\/\/[^@]*@/, '//***@');
+    const client = new MongoClient(cand, MONGO_CLIENT_OPTIONS);
+    log(`mongo: connecting to ${masked} (db ${dbName}) …`);
+    try {
+      await client.connect();
+      await client.db(dbName).command({ ping: 1 });
+      log(`mongo: connected to ${masked} db ${dbName}`);
+      return { client, db: client.db(dbName), dbName, uri: masked, async close() { try { await client.close(); } catch { /* ignore */ } } };
+    } catch (err) {
+      // surface the per-server reason (ECONNREFUSED / ETIMEDOUT / auth) instead of the generic "server selection timed out"
+      const servers = err?.reason?.servers ? [...err.reason.servers.values()].map((s) => `${s.address}: ${s.error?.message || s.type || 'unknown'}`) : [];
+      const why = `${masked}: ${err.message}${servers.length ? ` — ${servers.join('; ')}` : ''}`;
+      failures.push(why); log(`mongo: ${why}`);
+      try { await client.close(); } catch { /* ignore */ }
+    }
+  }
+  throw new Error(`cannot reach MongoDB (${failures.length} host${failures.length > 1 ? 's' : ''} tried). Check the CEMIG VPN/route (Test-NetConnection <host> -Port 27017) or pass --mongo-uri / set MONGO_URI. Details: ${failures.join(' | ')}`);
 }
 
 /** Time window of a split collection from its suffix: _yyyyMMdd (day), _yyyyMM (month), _yyyy (year). */
@@ -652,10 +676,10 @@ async function cmdRun(args) {
   // 3. loop
   const db = opts.source === 'mysql' ? mysqlSession(schema) : null;
   const api = opts.source === 'api' ? apiSession() : null;
-  const mongo = opts.source === 'mongo' ? await mongoSession(args['mongo-uri'] || DEFAULT_MONGO_URI, args['mongo-db'] || DEFAULT_MONGO_DB) : null;
+  const mongo = opts.source === 'mongo' ? await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB) : null;
   const tables = db ? await resolveRegisterTables(db, { explicit: args.tables, from: args.from, to: args.to })
     : mongo ? await resolveRegisterCollections(mongo, { explicit: args.collections, from: args.from, to: args.to }) : null;
-  progress.store = mongo ? `mongodb ${mongo.dbName}@${new URL(args['mongo-uri'] || DEFAULT_MONGO_URI).host}` : db ? `mysql ${schema}` : 'mdc api';
+  progress.store = mongo ? `mongodb ${mongo.dbName}@${new URL(mongo.uri).host}` : db ? `mysql ${schema}` : 'mdc api';
   if (tables) progress.tables = tables.map((t) => t.name);
   writeJsonAtomic(F.progress, progress);
   const t0 = Date.now(); let doneThisRun = 0;
@@ -1264,7 +1288,7 @@ async function cmdProbe(args) {
   // Mongo (records)
   let mongo = null;
   try {
-    mongo = await mongoSession(args['mongo-uri'] || DEFAULT_MONGO_URI, args['mongo-db'] || DEFAULT_MONGO_DB);
+    mongo = await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB);
     const cols = await resolveRegisterCollections(mongo, { explicit: args.collections, from: args.from, to: args.to });
     const latest = cols[cols.length - 1];
     const info = await mongoCollectionInfo(mongo, latest.name);
