@@ -99,3 +99,33 @@ collection family in every database and flags the families whose schema has the 
 and types; the full inventory goes to `outputdiscover.json`. Then it shows a sample document of any
 `*auto_register*` collection, then checks MySQL `archive_meter`, the `ops_auto_register_*` collections of
 `--mongo-db` and one meter's records with the rule applied. Equivalent to `node audit.mjs discover` + `node audit.mjs probe`.
+
+## Which Mongo is which (found 2026-10-15)
+
+| Host | Role | Databases | Reachable from nansenu01 |
+|---|---|---|---|
+| 10.30.104.31:27017 | **MDM** Mongo | `mdm` (11.8 TB), `nms` | yes |
+| 10.30.132.30:27017 | **AMI/MDC** Mongo (db `ami`: load profiles, `ops_auto_register_yyyyMM` …) | `ami` | no (different subnet) |
+
+For a machine that only reaches 10.30.104.x, use the SSH jump host that cemig-ext-data already uses for RocketMQ
+(`SSH_HOST` 10.30.104.40, credentials and plink path in its `.env`/`config.js`):
+
+```powershell
+node probe.mjs --tunnel                 # forwards 127.0.0.1:27117 -> 10.30.132.30:27017 through 10.30.104.40
+node audit.mjs run --tunnel
+node module-ids.mjs run --tunnel
+```
+
+`--tunnel other-host:27017` forwards to a different target. Manual equivalent:
+`plink -N -L 127.0.0.1:27117:10.30.132.30:27017 <user>@10.30.104.40`, then `--mongo-uri "mongodb://127.0.0.1:27117/ami?directConnection=true"`.
+
+### Finding the AMI Mongo from the jump host
+
+```powershell
+node probe.mjs --ssh-scan            # no manual plink needed: uses cemig-ext-data's SSH_HOST/SSH_USER/SSH_PASS + plink
+```
+
+Runs read-only commands on 10.30.104.40 and prints: mongo settings found in SanPlat config files and running java
+processes, established connections to port 27017, TCP reachability of candidate hosts (10.30.132.30, 10.30.104.31,
+.30, .60, .66, .71 and `--hosts a,b`), and the box's own addresses. Passwords are masked. Then use the host it reveals with
+`--mongo-uri` or `--tunnel host:27017`.

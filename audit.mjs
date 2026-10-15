@@ -20,7 +20,9 @@
  *   node audit.mjs run    [--source mysql|api] [--db <ami schema>] [--meters mysql|api|file]
  *                         [--meters-file list.txt] [--batch 200] [--limit N] [--no-build]
  *                         [--collections ops_auto_register_202608,...] [--from 'YYYY-MM-DD'] [--to 'YYYY-MM-DD']
- *                         [--mongo-uri mongodb://host:27017/?directConnection=true] [--mongo-db ami]
+ *                         [--mongo-uri mongodb://host:27017/?directConnection=true] [--mongo-db ami] [--tunnel [host:port]]
+ *   --tunnel              : SSH port-forward to the AMI Mongo through the cemig-ext-data jump host (SSH_HOST in its .env,
+ *                           plink). Default target 10.30.132.30:27017; use when only 10.30.104.x is routable.
  *
  * NOTE: ops_auto_register is a SPLIT table (registry db_split_table_def_n, split_uom 2 = monthly). Its consumers
  *       all read through mongoTemplate, so the rows live in MongoDB collections ops_auto_register_yyyyMM;
@@ -389,12 +391,49 @@ async function fetchRecordsMysql(db, meterNos, tables) {
 
 // ───────────────────────────────────────────────────────────── register records (MongoDB — the real source)
 /**
+ * SSH port-forward through the CEMIG jump host used by cemig-ext-data (SSH_HOST/SSH_USER/SSH_PASS + plink in its .env),
+ * for machines that reach 10.30.104.x but not the AMI Mongo subnet. Returns { localPort, close }.
+ */
+let tunnelPortSeq = 27117;
+async function openSshTunnel(targetHostPort, localPort = tunnelPortSeq++) {   // a fresh local port per tunnel: a just-killed plink may still hold the previous one
+  const { spawn } = await import('node:child_process');
+  const net = await import('node:net');
+  const { config } = await loadExt();
+  const plink = config.PLINK || 'C:\\Program Files\\PuTTY\\plink.exe';
+  if (!existsSync(plink)) throw new Error(`plink not found at ${plink} (install PuTTY or fix PLINK in cemig-ext-data/src/config.js)`);
+  const args = ['-batch', '-N', '-L', `127.0.0.1:${localPort}:${targetHostPort}`, '-pw', config.SSH_PASS, `${config.SSH_USER}@${config.SSH_HOST}`];
+  log(`tunnel: ${plink} -N -L 127.0.0.1:${localPort}:${targetHostPort} ${config.SSH_USER}@${config.SSH_HOST}`);
+  const child = spawn(plink, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  let stderr = ''; child.stderr.on('data', (d) => { stderr += d.toString(); });
+  let exited = false; child.on('exit', (code) => { exited = true; if (code) log(`tunnel: plink exited with code ${code}: ${stderr.trim().slice(0, 300)}`); });
+  const ready = await new Promise((resolve) => {
+    const deadline = Date.now() + 20000;
+    const tryConnect = () => {
+      if (exited) return resolve(false);
+      const s = net.connect({ host: '127.0.0.1', port: localPort }, () => { s.destroy(); resolve(true); });
+      s.on('error', () => { s.destroy(); if (Date.now() > deadline) resolve(false); else setTimeout(tryConnect, 500); });
+    };
+    setTimeout(tryConnect, 800);
+  });
+  if (!ready) { try { child.kill(); } catch { /* ignore */ } throw new Error(`tunnel to ${targetHostPort} via ${config.SSH_HOST} did not come up: ${stderr.trim().slice(0, 300) || 'no response on local port'}`); }
+  log(`tunnel: up on 127.0.0.1:${localPort}`);
+  return { localPort, close: () => { try { child.kill(); } catch { /* ignore */ } } };
+}
+
+/**
  * Opens the CEMIG Mongo. With no explicit --mongo-uri / MONGO_URI it tries each default host in turn
  * (primary first, then secondary) so a machine that only routes to one subnet still gets through.
+ * With tunnel = true (or a "host:port" string) the connection goes through openSshTunnel().
  */
-async function mongoSession(uri = null, dbName = DEFAULT_MONGO_DB) {
+async function mongoSession(uri = null, dbName = DEFAULT_MONGO_DB, { tunnel = null } = {}) {
   const explicit = uri || process.env.MONGO_URI || null;
-  const candidates = explicit ? [explicit] : DEFAULT_MONGO_HOSTS.map((h) => `mongodb://${h}/${dbName}?directConnection=true`);
+  let candidates = explicit ? [explicit] : DEFAULT_MONGO_HOSTS.map((h) => `mongodb://${h}/${dbName}?directConnection=true`);
+  let tun = null;
+  if (tunnel) {
+    const target = typeof tunnel === 'string' && tunnel.includes(':') ? tunnel : (explicit ? new URL(explicit).host : DEFAULT_MONGO_HOSTS[1]);
+    tun = await openSshTunnel(target.includes(':') ? target : `${target}:27017`);
+    candidates = [`mongodb://127.0.0.1:${tun.localPort}/${dbName}?directConnection=true`];
+  }
   const failures = [];
   for (const cand of candidates) {
     const masked = cand.replace(/\/\/[^@]*@/, '//***@');
@@ -404,7 +443,7 @@ async function mongoSession(uri = null, dbName = DEFAULT_MONGO_DB) {
       await client.connect();
       await client.db(dbName).command({ ping: 1 });
       log(`mongo: connected to ${masked} db ${dbName}`);
-      return { client, db: client.db(dbName), dbName, uri: masked, async close() { try { await client.close(); } catch { /* ignore */ } } };
+      return { client, db: client.db(dbName), dbName, uri: masked, async close() { try { await client.close(); } catch { /* ignore */ } tun?.close(); } };
     } catch (err) {
       // surface the per-server reason (ECONNREFUSED / ETIMEDOUT / auth) instead of the generic "server selection timed out"
       const servers = err?.reason?.servers ? [...err.reason.servers.values()].map((s) => `${s.address}: ${s.error?.message || s.type || 'unknown'}`) : [];
@@ -413,7 +452,8 @@ async function mongoSession(uri = null, dbName = DEFAULT_MONGO_DB) {
       try { await client.close(); } catch { /* ignore */ }
     }
   }
-  throw new Error(`cannot reach MongoDB (${failures.length} host${failures.length > 1 ? 's' : ''} tried). Check the CEMIG VPN/route (Test-NetConnection <host> -Port 27017) or pass --mongo-uri / set MONGO_URI. Details: ${failures.join(' | ')}`);
+  tun?.close();
+  throw new Error(`cannot reach MongoDB (${failures.length} host${failures.length > 1 ? 's' : ''} tried). Check the CEMIG VPN/route (Test-NetConnection <host> -Port 27017), pass --mongo-uri / set MONGO_URI, or use --tunnel [host:port] through the cemig-ext-data SSH host. Details: ${failures.join(' | ')}`);
 }
 
 /** Time window of a split collection from its suffix: _yyyyMMdd (day), _yyyyMM (month), _yyyy (year). */
@@ -677,7 +717,7 @@ async function cmdRun(args) {
   // 3. loop
   const db = opts.source === 'mysql' ? mysqlSession(schema) : null;
   const api = opts.source === 'api' ? apiSession() : null;
-  const mongo = opts.source === 'mongo' ? await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB) : null;
+  const mongo = opts.source === 'mongo' ? await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null }) : null;
   const tables = db ? await resolveRegisterTables(db, { explicit: args.tables, from: args.from, to: args.to })
     : mongo ? await resolveRegisterCollections(mongo, { explicit: args.collections, from: args.from, to: args.to }) : null;
   progress.store = mongo ? `mongodb ${mongo.dbName}@${new URL(mongo.uri).host}` : db ? `mysql ${schema}` : 'mdc api';
@@ -1289,7 +1329,7 @@ async function cmdProbe(args) {
   // Mongo (records)
   let mongo = null;
   try {
-    mongo = await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB);
+    mongo = await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null });
     const cols = await resolveRegisterCollections(mongo, { explicit: args.collections, from: args.from, to: args.to });
     const latest = cols[cols.length - 1];
     const info = await mongoCollectionInfo(mongo, latest.name);
@@ -1312,7 +1352,7 @@ async function cmdProbe(args) {
 async function cmdDiscover(args, injected = null) {
   ensureDirs();
   const pattern = new RegExp(args.pattern ? String(args.pattern) : 'regist|auto', 'i');
-  const mongo = injected || await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB);
+  const mongo = injected || await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null });
   try {
     const dbs = (await mongo.client.db().admin().listDatabases()).databases;
     log(`databases (${dbs.length}): ${dbs.map((d) => `${d.name} (${(d.sizeOnDisk / 1048576).toFixed(0)} MB)`).join(', ')}`);
@@ -1364,6 +1404,36 @@ async function cmdDiscover(args, injected = null) {
   } finally { if (!injected) await mongo.close(); }
 }
 
+// ───────────────────────────────────────────────────────────── ssh-scan (ask the jump host where Mongo is)
+/**
+ * Runs read-only commands on the cemig-ext-data SSH host (same plink + credentials as its RocketMQ job):
+ * greps the SanPlat configs for mongo settings, lists live connections to :27017, and TCP-tests candidate hosts.
+ */
+async function cmdSshScan(args) {
+  const { execFile } = await import('node:child_process');
+  const { config } = await loadExt();
+  const plink = config.PLINK || 'C:\\Program Files\\PuTTY\\plink.exe';
+  if (!existsSync(plink)) throw new Error(`plink not found at ${plink}`);
+  const extra = args.hosts ? String(args.hosts).split(',').map((s) => s.trim()).filter(Boolean) : [];
+  const candidates = [...new Set([...DEFAULT_MONGO_HOSTS.map((h) => h.split(':')[0]), '10.30.104.30', '10.30.104.60', '10.30.104.66', '10.30.104.71', ...extra])];
+  const steps = [
+    ['mongo settings in config files', `grep -rhoE "mongo-(host|port|db|user|addr)[[:space:]]*=[^[:space:]]*|spring\\.data\\.mongodb\\.[a-z]+[[:space:]]*=[^[:space:]]*|mongodb://[^[:space:]\\"']+" /opt /home /app /data /usr/local /etc /srv 2>/dev/null | sort -u | head -60`],
+    ['mongo settings in running java processes', `ps -eo args 2>/dev/null | grep -oE "(-D[a-zA-Z.]*mongo[^ ]*|spring\\.profiles\\.active=[^ ]+|--spring\\.config\\.location=[^ ]+)" | sort -u | head -40`],
+    ['established connections to port 27017', `(ss -tn state established '( dport = :27017 )' 2>/dev/null || netstat -tn 2>/dev/null | grep ':27017') | awk '{print $NF" <- "$(NF-1)}' | sort -u | head -40`],
+    ['TCP reachability of candidate hosts from this box', candidates.map((h) => `(timeout 3 bash -c "</dev/tcp/${h}/27017" 2>/dev/null && echo "${h}:27017 OPEN" || echo "${h}:27017 closed")`).join('; ')],
+    ['hostname / addresses', 'hostname; hostname -I 2>/dev/null || ip -4 addr 2>/dev/null | grep -oE "inet [0-9.]+"'],
+  ];
+  log(`ssh-scan: ${config.SSH_USER}@${config.SSH_HOST} via ${plink}`);
+  for (const [title, cmd] of steps) {
+    const out = await new Promise((resolve) => {
+      execFile(plink, ['-batch', '-pw', config.SSH_PASS, `${config.SSH_USER}@${config.SSH_HOST}`, cmd], { timeout: 90000, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
+        (err, stdout, stderr) => resolve((stdout || '') + (err ? `\n[ssh error] ${(stderr || err.message).trim().slice(0, 300)}` : '')));
+    });
+    const masked = out.replace(/(\/\/)[^@\/\s]+@/g, '$1***@').replace(/(pwd|password|passwd)(\s*=)[^\s]*/gi, '$1$2***').trim();
+    log(`── ${title} ──\n${masked || '(nothing)'}`);
+  }
+}
+
 // ───────────────────────────────────────────────────────────── main
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -1376,10 +1446,11 @@ async function main() {
     case 'reset': cmdReset(args); break;
     case 'probe': await cmdProbe(args); break;
     case 'discover': await cmdDiscover(args); break;
+    case 'ssh-scan': await cmdSshScan(args); break;
     default: console.log('usage: node audit.mjs run|build|status|reset|probe|discover [options] (see header of this file)'); process.exit(2);
   }
 }
 
-export { cmdProbe, cmdDiscover, analyzeMeter, parseContent, summarize, resolveRegisterTables, fetchRecordsMysql, ObjectId, mongoSession, mongoCollectionInfo, mongoTimeBound, MONGO_PROJECTION, resolveRegisterCollections, fetchRecordsMongo, normalizeMongoRow, mongoMeterField, suffixWindow, DEFAULT_MONGO_URI, DEFAULT_MONGO_DB, BASE_TABLE, STATUS, ANOMALY_TYPES, mysqlSession, detectAmiSchema, readJsonl, readJson, writeJsonAtomic, localStamp, normTime, trimStr, nowIso, ensureDirs, STATE_DIR, OUTPUT_DIR, DEFAULT_AMI_SCHEMA };
+export { cmdProbe, cmdDiscover, cmdSshScan, analyzeMeter, parseContent, summarize, resolveRegisterTables, fetchRecordsMysql, ObjectId, mongoSession, mongoCollectionInfo, mongoTimeBound, MONGO_PROJECTION, resolveRegisterCollections, fetchRecordsMongo, normalizeMongoRow, mongoMeterField, suffixWindow, DEFAULT_MONGO_URI, DEFAULT_MONGO_DB, BASE_TABLE, STATUS, ANOMALY_TYPES, mysqlSession, detectAmiSchema, readJsonl, readJson, writeJsonAtomic, localStamp, normTime, trimStr, nowIso, ensureDirs, STATE_DIR, OUTPUT_DIR, DEFAULT_AMI_SCHEMA };
 
 if (!process.env.AUDIT_NO_MAIN) main().catch((err) => { log(`FATAL: ${err.stack || err.message || err}`); process.exit(1); });
