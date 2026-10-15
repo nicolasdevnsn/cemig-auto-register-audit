@@ -85,3 +85,17 @@ Outputs: `output\module-ids.txt` (distinct list), `output\module-ids.xlsx` (Resu
 - Mongo (`module-ids.mjs`): per collection, `find(filter).sort({ _id: 1 }).limit(n)` with `_id > last` → walks the `_id` index, no in-memory sort.
 - MySQL fallback: `UNION ALL` over the monthly tables with `device_no IN (...)` (index `index_device_no`), and `WHERE id > ? ORDER BY id LIMIT n` (primary-key scan) respectively.
 - Meter list: `archive_meter` in MySQL, `ORDER BY meter_no LIMIT 50000 OFFSET n` (one-off, ~15 pages).
+
+## `probe.mjs` – find and check the data source
+
+```powershell
+node probe.mjs --meter PMD268024393            # discovery (all Mongo dbs + matching collections + samples) then the probe
+node probe.mjs --pattern "auto_register|regist" --skip-mysql
+```
+
+Prints every database on the CEMIG Mongo, the collections matching the pattern, then samples one document per
+collection family in every database and flags the families whose schema has the auto-register markers
+(`register_msg`, `register_status`, `device_no` + `register_time`, a string containing `"moduleId"`), with field names
+and types; the full inventory goes to `outputdiscover.json`. Then it shows a sample document of any
+`*auto_register*` collection, then checks MySQL `archive_meter`, the `ops_auto_register_*` collections of
+`--mongo-db` and one meter's records with the rule applied. Equivalent to `node audit.mjs discover` + `node audit.mjs probe`.

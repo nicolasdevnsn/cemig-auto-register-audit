@@ -27,6 +27,7 @@
  *       the MySQL table of the same name is an empty template (confirmed empty in prod on 2026-10-15).
  *   node audit.mjs build  [--dashboard-max-ok N]      rebuild dashboard/ + output/*.xlsx from state
  *   node audit.mjs status                               show progress
+ *   node audit.mjs discover [--pattern regist]           list Mongo databases + collections matching a pattern
  *   node audit.mjs probe  [--meter PMD268024393]        test MySQL + Mongo connectivity, show collections,
  *                                                       document shape and one meter's records (run this first)
  *   node audit.mjs reset  [--keep-meters]               delete state (asks for --yes)
@@ -443,7 +444,7 @@ async function resolveRegisterCollections(mongo, { explicit = null, from = null,
   }
   let cols = names.map((name) => ({ name, ...suffixWindow(name) }));
   if (from || to) cols = cols.filter((c) => (!c.end || !from || c.end >= from) && (!c.start || !to || c.start <= to));
-  if (!cols.length) throw new Error(`no collection ${BASE_TABLE}_* found in Mongo db ${mongo.dbName} (check --mongo-uri / --mongo-db, or pass --collections)`);
+  if (!cols.length) throw new Error(`no collection ${BASE_TABLE}_* found in Mongo db ${mongo.dbName}. Run \`node audit.mjs discover\` to list databases/collections, then pass --mongo-db <db> and/or --collections a,b`);
   log(`register collections (${cols.length}): ${cols.map((c) => c.name).join(', ')}`);
   return cols;
 }
@@ -1277,7 +1278,7 @@ ${vendorTags}
 async function cmdProbe(args) {
   const meterNo = args.meter ? String(args.meter) : null;
   // MySQL (meter list)
-  try {
+  if (process.env.AUDIT_SKIP_MYSQL || args['skip-mysql']) log('mysql: skipped'); else try {
     const schema = await detectAmiSchema(args.db);
     const db = mysqlSession(schema);
     const [{ n }] = await db.query('SELECT COUNT(*) AS n FROM archive_meter WHERE delete_flag = 0', [], 1);
@@ -1307,6 +1308,62 @@ async function cmdProbe(args) {
   finally { await mongo?.close(); }
 }
 
+// ───────────────────────────────────────────────────────────── discover (where are the collections?)
+async function cmdDiscover(args, injected = null) {
+  ensureDirs();
+  const pattern = new RegExp(args.pattern ? String(args.pattern) : 'regist|auto', 'i');
+  const mongo = injected || await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB);
+  try {
+    const dbs = (await mongo.client.db().admin().listDatabases()).databases;
+    log(`databases (${dbs.length}): ${dbs.map((d) => `${d.name} (${(d.sizeOnDisk / 1048576).toFixed(0)} MB)`).join(', ')}`);
+    for (const d of dbs) {
+      if (['admin', 'local', 'config'].includes(d.name)) continue;
+      let names;
+      try { names = (await mongo.client.db(d.name).listCollections({}, { nameOnly: true }).toArray()).map((c) => c.name).sort(); }
+      catch (err) { log(`${d.name}: cannot list collections (${err.message})`); continue; }
+      const hits = names.filter((n) => pattern.test(n));
+      log(`${d.name}: ${names.length} collections · ${hits.length} matching /${pattern.source}/i${hits.length ? ': ' + hits.slice(0, 40).join(', ') + (hits.length > 40 ? ', …' : '') : ''}`);
+      if (d.name === mongo.dbName && !hits.length) log(`${d.name}: first 60 collection names: ${names.slice(0, 60).join(', ')}`);
+    }
+    // ── schema search: one sample document per collection FAMILY (name without its _yyyyMM/_yyyy/_yyyyMMdd suffix),
+    //    in every database, so a collection with an unexpected name is still found by what its documents contain.
+    const family = (n) => n.replace(/_\d{4,8}$/, '');
+    const SCHEMA_MARKERS = [/^register_?msg$/i, /^register_?status$/i, /^register_?result$/i, /^module_?id$/i, /^mac_?address$/i, /^upper_?device_?no$/i, /^device_?no$/i, /^register_?time$/i];
+    const typeOf = (v) => (v === null ? 'null' : v instanceof Date ? 'Date' : v instanceof ObjectId ? 'ObjectId' : Array.isArray(v) ? 'array' : typeof v);
+    const inventory = [];
+    for (const d of dbs) {
+      if (['admin', 'local', 'config'].includes(d.name)) continue;
+      let names;
+      try { names = (await mongo.client.db(d.name).listCollections({}, { nameOnly: true }).toArray()).map((c) => c.name).filter((n) => !n.startsWith('system.')); } catch { continue; }
+      const families = new Map();
+      for (const n of names) { const f = family(n); const list = families.get(f) || []; list.push(n); families.set(f, list); }
+      log(`${d.name}: scanning ${families.size} collection families (${names.length} collections) …`);
+      for (const [f, members] of [...families.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        const newest = [...members].sort().pop();
+        let doc = null, count = null;
+        try { doc = await mongo.client.db(d.name).collection(newest).findOne({}); count = await mongo.client.db(d.name).collection(newest).estimatedDocumentCount(); } catch (err) { log(`  ${d.name}.${newest}: ${err.message}`); continue; }
+        const fields = doc ? Object.keys(doc) : [];
+        const hits = fields.filter((k) => SCHEMA_MARKERS.some((re) => re.test(k)));
+        const moduleIdInString = doc ? Object.values(doc).some((v) => typeof v === 'string' && /"moduleId"\s*:/.test(v)) : false;
+        const score = hits.length + (moduleIdInString ? 3 : 0) + (/auto_register/i.test(f) ? 3 : 0);
+        inventory.push({ db: d.name, family: f, collections: members.length, newest, count, fields: Object.fromEntries(fields.map((k) => [k, typeOf(doc[k])])), hits, moduleIdInString, score });
+      }
+    }
+    inventory.sort((a, b) => b.score - a.score || a.db.localeCompare(b.db) || a.family.localeCompare(b.family));
+    const candidates = inventory.filter((x) => x.score >= 3);
+    log(`schema search: ${inventory.length} families sampled · ${candidates.length} candidate(s) with auto-register markers`);
+    for (const x of candidates) {
+      log(`  CANDIDATE ${x.db}.${x.family} (${x.collections} collections, newest ${x.newest}, ~${x.count} docs) · markers: ${x.hits.join(', ') || '-'}${x.moduleIdInString ? ' · a string field contains "moduleId"' : ''}`);
+      log(`    fields: ${Object.entries(x.fields).map(([k, t]) => `${k}:${t}`).join(', ')}`);
+      const sample = await mongo.client.db(x.db).collection(x.newest).findOne({});
+      if (sample) log(`    sample: ${JSON.stringify(sample, (k, v) => (v instanceof ObjectId ? v.toHexString() : v)).slice(0, 700)}`);
+    }
+    writeFileSync(join(OUTPUT_DIR, 'discover.json'), JSON.stringify({ generatedAt: localStamp(), uri: mongo.uri, databases: dbs.map((d) => d.name), inventory }, null, 2), 'utf8');
+    log(`full inventory (every family, its fields and types): ${join(OUTPUT_DIR, 'discover.json')}`);
+    return inventory;
+  } finally { if (!injected) await mongo.close(); }
+}
+
 // ───────────────────────────────────────────────────────────── main
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -1318,10 +1375,11 @@ async function main() {
     case 'status': await cmdStatus(); break;
     case 'reset': cmdReset(args); break;
     case 'probe': await cmdProbe(args); break;
-    default: console.log('usage: node audit.mjs run|build|status|reset|probe [options] (see header of this file)'); process.exit(2);
+    case 'discover': await cmdDiscover(args); break;
+    default: console.log('usage: node audit.mjs run|build|status|reset|probe|discover [options] (see header of this file)'); process.exit(2);
   }
 }
 
-export { analyzeMeter, parseContent, summarize, resolveRegisterTables, fetchRecordsMysql, ObjectId, mongoSession, mongoCollectionInfo, mongoTimeBound, MONGO_PROJECTION, resolveRegisterCollections, fetchRecordsMongo, normalizeMongoRow, mongoMeterField, suffixWindow, DEFAULT_MONGO_URI, DEFAULT_MONGO_DB, BASE_TABLE, STATUS, ANOMALY_TYPES, mysqlSession, detectAmiSchema, readJsonl, readJson, writeJsonAtomic, localStamp, normTime, trimStr, nowIso, ensureDirs, STATE_DIR, OUTPUT_DIR, DEFAULT_AMI_SCHEMA };
+export { cmdProbe, cmdDiscover, analyzeMeter, parseContent, summarize, resolveRegisterTables, fetchRecordsMysql, ObjectId, mongoSession, mongoCollectionInfo, mongoTimeBound, MONGO_PROJECTION, resolveRegisterCollections, fetchRecordsMongo, normalizeMongoRow, mongoMeterField, suffixWindow, DEFAULT_MONGO_URI, DEFAULT_MONGO_DB, BASE_TABLE, STATUS, ANOMALY_TYPES, mysqlSession, detectAmiSchema, readJsonl, readJson, writeJsonAtomic, localStamp, normTime, trimStr, nowIso, ensureDirs, STATE_DIR, OUTPUT_DIR, DEFAULT_AMI_SCHEMA };
 
 if (!process.env.AUDIT_NO_MAIN) main().catch((err) => { log(`FATAL: ${err.stack || err.message || err}`); process.exit(1); });
