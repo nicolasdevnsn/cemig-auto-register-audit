@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# run state (meter list cache, results, checkpoints, logs)
+state/
+
+# generated artefacts (dashboard, xlsx, summaries)
+dashboard/
+output/
+
+# local secrets / overrides (credentials live in ../cemig-ext-data/.env)
+.env
+.env.*
+!.env.example
+
+# editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
