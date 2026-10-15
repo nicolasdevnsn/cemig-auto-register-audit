@@ -17,15 +17,25 @@
  * dashboard and exits. Run again to continue from where it stopped.
  *
  * Commands
- *   node audit.mjs run    [--source mysql|api] [--db <ami schema>] [--meters api|mysql|file]
+ *   node audit.mjs run    [--source mysql|api] [--db <ami schema>] [--meters mysql|api|file]
  *                         [--meters-file list.txt] [--batch 200] [--limit N] [--no-build]
+ *                         [--collections ops_auto_register_202608,...] [--from 'YYYY-MM-DD'] [--to 'YYYY-MM-DD']
+ *                         [--mongo-uri mongodb://host:27017/?directConnection=true] [--mongo-db ami]
+ *
+ * NOTE: ops_auto_register is a SPLIT table (registry db_split_table_def_n, split_uom 2 = monthly). Its consumers
+ *       all read through mongoTemplate, so the rows live in MongoDB collections ops_auto_register_yyyyMM;
+ *       the MySQL table of the same name is an empty template (confirmed empty in prod on 2026-10-15).
  *   node audit.mjs build  [--dashboard-max-ok N]      rebuild dashboard/ + output/*.xlsx from state
  *   node audit.mjs status                               show progress
+ *   node audit.mjs probe  [--meter PMD268024393]        test MySQL + Mongo connectivity, show collections,
+ *                                                       document shape and one meter's records (run this first)
  *   node audit.mjs reset  [--keep-meters]               delete state (asks for --yes)
  *
  * Sources
- *   --source mysql (default): direct query on ops_auto_register in schema 'ami' (same MySQL server/user
- *                             as ../cemig-ext-data/.env; auto-detected if 'ami' has no such table; --db overrides)
+ *   --source mongo (default): MongoDB db 'ami' (MONGO_URI / --mongo-uri, --mongo-db), monthly collections
+ *                             ops_auto_register_yyyyMM resolved from the server (--collections a,b overrides)
+ *   --source mysql          : MySQL ops_auto_register_yyyyMM tables (only if a deployment keeps them in MySQL;
+ *                             schema 'ami' on the cemig-ext-data server, --db overrides)
  *   --source api            : same endpoint the screen uses, GET /ami/collection/V1/register/result
  *                             (slow: one PowerShell request per meter page; logs in with the
  *                             shared SanPlat account, which invalidates other sessions)
@@ -41,6 +51,7 @@ import { createInterface } from 'node:readline';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import mysql from 'mysql2/promise';
+import { MongoClient, ObjectId } from 'mongodb';
 import ExcelJS from 'exceljs';
 
 // ───────────────────────────────────────────────────────────── paths & constants
@@ -83,8 +94,13 @@ const DEVICE_TYPE_LABEL = { '01': 'DCU', '02': 'Medidor', '05': 'Caixa de mediç
 // same server/user as cemig-ext-data's MYSQL_CONFIG (db nms); the AMI schema is 'ami' (see cemig-ext-data/src/fetch-archive-poc.mjs)
 const DEFAULT_AMI_SCHEMA = 'ami';
 
+// Where the screen's rows really live: MongoDB (db `ami`), monthly collections ops_auto_register_yyyyMM,
+// per the split registry db_split_table_def_n (its consumers all go through mongoTemplate).
+const DEFAULT_MONGO_URI = process.env.MONGO_URI || 'mongodb://10.30.132.30:27017/?directConnection=true';
+const DEFAULT_MONGO_DB = process.env.MONGO_DB || 'ami';
+
 const DEFAULTS = {
-  source: 'mysql',
+  source: 'mongo',
   meters: 'mysql',
   batch: 200,
   pageSize: 200,         // MDC meters endpoint
@@ -188,7 +204,7 @@ async function detectAmiSchema(explicit) {
   const conn = await openMysql();
   try {
     const [rows] = await conn.query(
-      "SELECT table_schema AS s, table_rows AS n FROM information_schema.tables WHERE table_name = 'ops_auto_register' ORDER BY (table_schema = ?) DESC, table_rows DESC", [DEFAULT_AMI_SCHEMA]
+      "SELECT table_schema AS s, SUM(table_rows) AS n FROM information_schema.tables WHERE table_name LIKE 'ops\\_auto\\_register%' GROUP BY table_schema ORDER BY (table_schema = ?) DESC, n DESC", [DEFAULT_AMI_SCHEMA]
     );
     if (!rows.length) throw new Error('no schema on this MySQL server has table ops_auto_register; pass --db <schema> or set AMI_MYSQL_DATABASE');
     if (rows.length > 1) log(`several schemas have ops_auto_register: ${rows.map((r) => `${r.s} (~${r.n} rows)`).join(', ')} — using ${rows[0].s}; override with --db`);
@@ -309,17 +325,163 @@ async function loadMeterList() {
 const REG_COLUMNS = `id, device_no AS deviceNo, device_category AS deviceCategory, register_time AS registerTime,
   register_status AS registerStatus, register_result AS registerResult, register_msg AS registerMsg,
   upper_device_type AS upperDeviceType, upper_device_no AS upperDeviceNo, ip, port, mac_address AS macAddress`;
+const BASE_TABLE = 'ops_auto_register';
 
-async function fetchRecordsMysql(db, meterNos) {
-  const rows = await db.query(
-    `SELECT ${REG_COLUMNS} FROM ops_auto_register WHERE device_no IN (?) ORDER BY device_no, register_time, id`, [meterNos]
-  );
+/**
+ * ops_auto_register is a SPLIT table in SanPlat (db_split_table_def_n: split_uom 2 = one physical table per
+ * month, named ops_auto_register_yyyyMM; db_split_table_detail_n lists them with their time window).
+ * The base table is only the template and stays empty. Resolution order:
+ *   1. --tables a,b,c (explicit)      2. db_split_table_detail_n rows for def_name = base
+ *   3. SHOW TABLES LIKE 'ops_auto_register_%'      4. the base table itself, if it has rows
+ * Returns [{ name, start, end }] in chronological order (start/end null when unknown).
+ */
+async function resolveRegisterTables(db, { explicit = null, from = null, to = null } = {}) {
+  let tables = [];
+  if (explicit) tables = String(explicit).split(',').map((t) => ({ name: t.trim(), start: null, end: null })).filter((t) => t.name);
+  if (!tables.length) {
+    try {
+      const rows = await db.query(
+        'SELECT table_name AS name, start_time AS start, end_time AS end FROM db_split_table_detail_n WHERE def_name = ? ORDER BY start_time, table_name', [BASE_TABLE], 1
+      );
+      tables = rows.map((r) => ({ name: r.name, start: normTime(r.start), end: normTime(r.end) }));
+      if (tables.length) log(`split registry: ${tables.length} physical tables for ${BASE_TABLE} (${tables[0].name} .. ${tables[tables.length - 1].name})`);
+    } catch (err) { log(`split registry not readable (${err.message}) — falling back to SHOW TABLES`); }
+  }
+  if (!tables.length) {
+    const rows = await db.query(`SHOW TABLES LIKE '${BASE_TABLE}\\_%'`);
+    tables = rows.map((r) => ({ name: String(Object.values(r)[0]), start: null, end: null })).filter((t) => /^ops_auto_register_\d{4,8}$/.test(t.name)).sort((a, b) => a.name.localeCompare(b.name));
+    if (tables.length) log(`SHOW TABLES: ${tables.length} physical tables for ${BASE_TABLE}`);
+  }
+  // keep only tables that actually exist (registry rows may reference dropped/expired tables)
+  const existing = new Set((await db.query(`SHOW TABLES LIKE '${BASE_TABLE}%'`)).map((r) => String(Object.values(r)[0])));
+  const missing = tables.filter((t) => !existing.has(t.name)).map((t) => t.name);
+  if (missing.length) log(`ignoring ${missing.length} registry tables that do not exist: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ', …' : ''}`);
+  tables = tables.filter((t) => existing.has(t.name));
+  // time-window pruning (only when the registry gave us the window)
+  if (from || to) tables = tables.filter((t) => (!t.end || !from || t.end >= from) && (!t.start || !to || t.start <= to));
+  // the base table itself, only if it holds rows
+  if (existing.has(BASE_TABLE)) {
+    const probe = await db.query(`SELECT 1 FROM ${BASE_TABLE} LIMIT 1`);
+    if (probe.length) { log(`base table ${BASE_TABLE} is not empty — included`); tables.push({ name: BASE_TABLE, start: null, end: null }); }
+  }
+  if (!tables.length) throw new Error(`no physical table found for ${BASE_TABLE} (registry, SHOW TABLES and base table are all empty) — check the schema (--db) or pass --tables`);
+  log(`register tables: ${tables.map((t) => t.name).join(', ')}`);
+  return tables;
+}
+
+async function fetchRecordsMysql(db, meterNos, tables) {
+  // one round trip per batch: UNION ALL over the monthly tables, then a client-side sort
+  const sql = tables.map((t) => `SELECT ${REG_COLUMNS} FROM ${t.name} WHERE device_no IN (?)`).join('\nUNION ALL\n');
+  const rows = await db.query(sql, tables.map(() => meterNos));
   const byMeter = new Map();
   for (const r of rows) {
     r.registerTime = normTime(r.registerTime);
     const list = byMeter.get(r.deviceNo) || []; list.push(r); byMeter.set(r.deviceNo, list);
   }
+  for (const list of byMeter.values()) list.sort((a, b) => (a.registerTime || '').localeCompare(b.registerTime || '') || String(a.id).localeCompare(String(b.id)));
   return byMeter;
+}
+
+// ───────────────────────────────────────────────────────────── register records (MongoDB — the real source)
+async function mongoSession(uri = DEFAULT_MONGO_URI, dbName = DEFAULT_MONGO_DB) {
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 20000 });
+  await client.connect();
+  const db = client.db(dbName);
+  log(`mongo: connected to ${uri.replace(/\/\/[^@]*@/, '//***@')} db ${dbName}`);
+  return { client, db, dbName, async close() { try { await client.close(); } catch { /* ignore */ } } };
+}
+
+/** Time window of a split collection from its suffix: _yyyyMMdd (day), _yyyyMM (month), _yyyy (year). */
+function suffixWindow(name) {
+  const m = name.match(/_(\d{4})(\d{2})?(\d{2})?$/);
+  if (!m) return { start: null, end: null };
+  const y = +m[1], mo = m[2] ? +m[2] : null, d = m[3] ? +m[3] : null;
+  const p = (n) => String(n).padStart(2, '0');
+  if (d) return { start: `${y}-${p(mo)}-${p(d)} 00:00:00`, end: `${y}-${p(mo)}-${p(d)} 23:59:59` };
+  if (mo) { const last = new Date(y, mo, 0).getDate(); return { start: `${y}-${p(mo)}-01 00:00:00`, end: `${y}-${p(mo)}-${p(last)} 23:59:59` }; }
+  return { start: `${y}-01-01 00:00:00`, end: `${y}-12-31 23:59:59` };
+}
+
+/**
+ * Lists the physical Mongo collections of ops_auto_register: ops_auto_register_<suffix> in chronological order,
+ * plus the base collection if it holds documents. --collections (explicit) overrides; --from/--to prune.
+ */
+async function resolveRegisterCollections(mongo, { explicit = null, from = null, to = null } = {}) {
+  let names;
+  if (explicit) names = String(explicit).split(',').map((s) => s.trim()).filter(Boolean);
+  else {
+    const all = (await mongo.db.listCollections({ name: { $regex: `^${BASE_TABLE}` } }, { nameOnly: true }).toArray()).map((c) => c.name);
+    names = all.filter((n) => new RegExp(`^${BASE_TABLE}_\\d{4,8}$`).test(n)).sort((a, b) => a.localeCompare(b));
+    if (all.includes(BASE_TABLE)) {
+      const n = await mongo.db.collection(BASE_TABLE).estimatedDocumentCount();
+      if (n > 0) { log(`base collection ${BASE_TABLE} holds ~${n} documents — included`); names.push(BASE_TABLE); }
+    }
+  }
+  let cols = names.map((name) => ({ name, ...suffixWindow(name) }));
+  if (from || to) cols = cols.filter((c) => (!c.end || !from || c.end >= from) && (!c.start || !to || c.start <= to));
+  if (!cols.length) throw new Error(`no collection ${BASE_TABLE}_* found in Mongo db ${mongo.dbName} (check --mongo-uri / --mongo-db, or pass --collections)`);
+  log(`register collections (${cols.length}): ${cols.map((c) => c.name).join(', ')}`);
+  return cols;
+}
+
+const MONGO_INFO_CACHE = new Map();
+/**
+ * Samples one document of a collection to learn its field naming (snake_case @Field names are expected:
+ * device_no, register_time ...; camelCase is tolerated) and whether register_time is a BSON Date or a string.
+ * Needed so filters ($in on the meter field, time windows) hit the real field with the right BSON type.
+ */
+async function mongoCollectionInfo(mongo, name) {
+  if (MONGO_INFO_CACHE.has(name)) return MONGO_INFO_CACHE.get(name);
+  const doc = await mongo.db.collection(name).findOne({}, { projection: { device_no: 1, deviceNo: 1, register_time: 1, registerTime: 1, device_category: 1, deviceCategory: 1 } });
+  const camel = !!doc && doc.deviceNo !== undefined && doc.device_no === undefined;
+  const info = {
+    sampled: !!doc, meterField: camel ? 'deviceNo' : 'device_no', timeField: camel ? 'registerTime' : 'register_time', categoryField: camel ? 'deviceCategory' : 'device_category',
+    timeIsDate: !!doc && (doc.register_time ?? doc.registerTime) instanceof Date,
+  };
+  if (doc && !MONGO_INFO_CACHE.size) log(`mongo document shape (${name}): meter field ${info.meterField}, ${info.timeField} stored as ${info.timeIsDate ? 'Date' : typeof (doc.register_time ?? doc.registerTime)}`);
+  MONGO_INFO_CACHE.set(name, info);
+  return info;
+}
+const mongoMeterField = async (mongo, name) => (await mongoCollectionInfo(mongo, name)).meterField;
+/** Builds a {$gte,$lte} bound for the time field with the BSON type the collection actually uses. */
+function mongoTimeBound(info, from, to) {
+  const conv = (s) => (info.timeIsDate ? new Date(String(s).replace(' ', 'T')) : String(s));
+  const b = {}; if (from) b.$gte = conv(from); if (to) b.$lte = conv(to); return b;
+}
+const MONGO_PROJECTION = { _id: 1, device_no: 1, deviceNo: 1, device_category: 1, deviceCategory: 1, register_time: 1, registerTime: 1, register_status: 1, registerStatus: 1, register_result: 1, registerResult: 1,
+  register_msg: 1, registerMsg: 1, upper_device_type: 1, upperDeviceType: 1, upper_device_no: 1, upperDeviceNo: 1, lastUpperDeviceNo: 1, ip: 1, port: 1, mac_address: 1, macAddress: 1, wiring_phase: 1, wiringPhase: 1 };
+
+function normalizeMongoRow(d) {
+  const g = (...ks) => { for (const k of ks) if (d[k] !== undefined && d[k] !== null) return d[k]; return null; };
+  return {
+    id: d._id instanceof ObjectId ? d._id.toHexString() : String(d._id), deviceNo: trimStr(g('device_no', 'deviceNo')), deviceCategory: g('device_category', 'deviceCategory'),
+    registerTime: normTime(g('register_time', 'registerTime')), registerStatus: g('register_status', 'registerStatus'), registerResult: g('register_result', 'registerResult'),
+    registerMsg: g('register_msg', 'registerMsg'), upperDeviceType: g('upper_device_type', 'upperDeviceType'), upperDeviceNo: g('upper_device_no', 'upperDeviceNo', 'lastUpperDeviceNo'),
+    ip: g('ip'), port: g('port'), macAddress: g('mac_address', 'macAddress'), wiringPhase: g('wiring_phase', 'wiringPhase'),
+  };
+}
+
+async function fetchRecordsMongo(mongo, meterNos, collections, attempts = 4) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const perCol = await Promise.all(collections.map(async (c) => {
+        const field = await mongoMeterField(mongo, c.name);
+        return mongo.db.collection(c.name).find({ [field]: { $in: meterNos } }, { projection: MONGO_PROJECTION }).toArray();
+      }));
+      const byMeter = new Map();
+      for (const docs of perCol) for (const d of docs) {
+        const r = normalizeMongoRow(d);
+        const list = byMeter.get(r.deviceNo) || []; list.push(r); byMeter.set(r.deviceNo, list);
+      }
+      for (const list of byMeter.values()) list.sort((a, b) => (a.registerTime || '').localeCompare(b.registerTime || '') || a.id.localeCompare(b.id));
+      return byMeter;
+    } catch (err) {
+      lastErr = err; log(`mongo error (attempt ${i}/${attempts}): ${err.message}`);
+      if (i < attempts) await sleep(Math.min(60000, 5000 * i));
+    }
+  }
+  throw lastErr;
 }
 
 function apiSession() {
@@ -462,13 +624,13 @@ async function cmdRun(args) {
   opts.limit = args.limit !== undefined ? Number(args.limit) : Infinity;
   opts.maxSamples = Number(args['max-samples']) || DEFAULTS.maxSamples;
   opts.maxTimeline = Number(args['max-timeline']) || DEFAULTS.maxTimeline;
-  if (!['mysql', 'api'].includes(opts.source)) throw new Error(`--source must be mysql or api (got ${opts.source})`);
+  if (!['mongo', 'mysql', 'api'].includes(opts.source)) throw new Error(`--source must be mongo, mysql or api (got ${opts.source})`);
   if (!['api', 'mysql', 'file'].includes(opts.meters)) throw new Error(`--meters must be api, mysql or file (got ${opts.meters})`);
   installSignalHandlers();
   log(`run: source=${opts.source} meters=${opts.meters} batch=${opts.batch}${Number.isFinite(opts.limit) ? ` limit=${opts.limit}` : ''}`);
 
   let schema = null;
-  if (opts.source === 'mysql' || opts.meters === 'mysql') { schema = await detectAmiSchema(args.db); log(`AMI schema: ${schema}`); }
+  if (opts.source === 'mysql' || opts.meters === 'mysql') { schema = await detectAmiSchema(args.db); log(`AMI MySQL schema: ${schema}`); }
 
   // 1. meter list (fetched once, cached in state/meters.jsonl)
   if (opts.meters === 'file') { if (!readJson(F.metersProgress, {}).done || args['meters-file']) importMetersFile(args['meters-file']); }
@@ -490,13 +652,19 @@ async function cmdRun(args) {
   // 3. loop
   const db = opts.source === 'mysql' ? mysqlSession(schema) : null;
   const api = opts.source === 'api' ? apiSession() : null;
+  const mongo = opts.source === 'mongo' ? await mongoSession(args['mongo-uri'] || DEFAULT_MONGO_URI, args['mongo-db'] || DEFAULT_MONGO_DB) : null;
+  const tables = db ? await resolveRegisterTables(db, { explicit: args.tables, from: args.from, to: args.to })
+    : mongo ? await resolveRegisterCollections(mongo, { explicit: args.collections, from: args.from, to: args.to }) : null;
+  progress.store = mongo ? `mongodb ${mongo.dbName}@${new URL(args['mongo-uri'] || DEFAULT_MONGO_URI).host}` : db ? `mysql ${schema}` : 'mdc api';
+  if (tables) progress.tables = tables.map((t) => t.name);
+  writeJsonAtomic(F.progress, progress);
   const t0 = Date.now(); let doneThisRun = 0;
   try {
     while (progress.nextIndex < meters.length && doneThisRun < opts.limit && !stopRequested) {
       const size = Math.min(opts.batch, meters.length - progress.nextIndex, opts.limit - doneThisRun);
       const batch = meters.slice(progress.nextIndex, progress.nextIndex + size);
       const nos = batch.map((m) => m.meterNo);
-      const byMeter = db ? await fetchRecordsMysql(db, nos) : await fetchRecordsApi(api, nos, opts);
+      const byMeter = mongo ? await fetchRecordsMongo(mongo, nos, tables) : db ? await fetchRecordsMysql(db, nos, tables) : await fetchRecordsApi(api, nos, opts);
       const lines = [];
       let conflicts = 0, anomalies = 0, noRecords = 0, records = 0;
       for (const m of batch) {
@@ -514,7 +682,7 @@ async function cmdRun(args) {
       const remaining = meters.length - progress.nextIndex; const eta = rate > 0 ? Math.round(remaining / rate / 60) : null;
       log(`${progress.nextIndex}/${meters.length} (${(100 * progress.nextIndex / meters.length).toFixed(1)}%) · batch: ${records} records, ${conflicts} conflicts, ${anomalies} with anomalies, ${noRecords} without records · ${rate.toFixed(1)} m/s${eta !== null ? ` · ETA ${eta} min` : ''}`);
     }
-  } finally { await db?.close(); }
+  } finally { await db?.close(); await mongo?.close(); }
 
   if (progress.nextIndex >= meters.length) { progress.finishedAt = nowIso(); writeJsonAtomic(F.progress, progress); log('analysis complete'); }
   else log(stopRequested ? 'stopped by request — run again to continue' : `stopped after --limit (${doneThisRun} meters this run)`);
@@ -553,7 +721,7 @@ function summarize(results, progress) {
   const s = {
     generatedAt: localStamp(), metersTotal: progress?.metersTotal ?? results.length, analyzed: results.length,
     pending: Math.max(0, (progress?.metersTotal ?? results.length) - results.length), finished: !!progress?.finishedAt,
-    source: progress?.source || null, schema: progress?.schema || null, startedAt: progress?.startedAt || null, updatedAt: progress?.updatedAt || null,
+    source: progress?.source || null, store: progress?.store || null, schema: progress?.schema || null, startedAt: progress?.startedAt || null, updatedAt: progress?.updatedAt || null,
     status: Object.fromEntries(STATUS.map((k) => [k, 0])), anomalies: Object.fromEntries(ANOMALY_TYPES.map((k) => [k, 0])),
     metersWithAnomalies: 0, anomalyRows: 0, recordsTotal: 0, successes: 0, failures: 0,
     conflictsByMonth: {}, anomaliesByMonth: {}, recordsByMonth: {}, conflictRegStatus: {}, months: [],
@@ -597,7 +765,7 @@ async function writeXlsx(results, summary) {
   const sm = wb.addWorksheet('Resumo');
   addHeader(sm, [{ h: 'Indicador', k: 'k', w: 42 }, { h: 'Valor', k: 'v', w: 24 }]);
   const rowsSummary = [
-    ['Gerado em', summary.generatedAt], ['Fonte', summary.source], ['Schema MySQL', summary.schema], ['Análise concluída', summary.finished ? 'sim' : 'não'],
+    ['Gerado em', summary.generatedAt], ['Fonte', summary.source], ['Origem dos registros', summary.store], ['Schema MySQL (lista de medidores)', summary.schema], ['Análise concluída', summary.finished ? 'sim' : 'não'],
     ['Medidores na lista', summary.metersTotal], ['Medidores analisados', summary.analyzed], ['Medidores pendentes', summary.pending],
     ...STATUS.map((k) => [STATUS_LABEL[k], summary.status[k] || 0]),
     ['Medidores com anomalias', summary.metersWithAnomalies], ['Registros com anomalia', summary.anomalyRows],
@@ -887,7 +1055,7 @@ ${vendorTags}
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", renderAll);
 
   // ------------------------------------------------------------ header
-  $("subtitle").textContent = \`\${fmt(S.analyzed)} de \${fmt(S.metersTotal)} medidores analisados (\${pct(S.analyzed, S.metersTotal)})\${S.finished ? " · análise concluída" : " · análise em andamento"} · \${fmt(S.recordsTotal)} registros lidos · fonte \${S.source || "?"}\${S.schema ? " · " + S.schema : ""} · gerado em \${(S.generatedAt || "").replace("T", " ").slice(0, 19)}\`;
+  $("subtitle").textContent = \`\${fmt(S.analyzed)} de \${fmt(S.metersTotal)} medidores analisados (\${pct(S.analyzed, S.metersTotal)})\${S.finished ? " · análise concluída" : " · análise em andamento"} · \${fmt(S.recordsTotal)} registros lidos · fonte \${S.store || S.source || "?"} · gerado em \${(S.generatedAt || "").replace("T", " ").slice(0, 19)}\`;
   $("progressBar").style.width = pct(S.analyzed, S.metersTotal).replace(",", ".");
   $("rule").innerHTML = "<b>Regra:</b> para cada medidor da lista, os registros da tela <i>Registro de dispositivo</i> (tabela <code>ops_auto_register</code>) são ordenados por <i>Registrado em</i> (crescente) e o campo <code>moduleId</code> do JSON da coluna <i>Conteúdo</i> é acompanhado. <b>Conflito</b> = o moduleId mudou ao longo do tempo (o medidor deixa de ser analisado a partir daí). <b>Anomalia</b> = registro com conteúdo vazio, que não é JSON ou JSON sem moduleId (contada; o medidor continua sendo analisado). Medidor sem nenhum registro = anomalia <i>Sem registros</i>." + (S.dashboardOkOmitted ? \` <b>Atenção:</b> \${fmt(S.dashboardOkOmitted)} medidores consistentes sem anomalias foram omitidos das tabelas deste dashboard (limite --dashboard-max-ok); os totais e o XLSX completo os incluem.\` : "");
   for (const k of STATUS) { const o = document.createElement("option"); o.value = k; o.textContent = SL[k]; $("f-status").appendChild(o); }
@@ -1063,7 +1231,7 @@ ${vendorTags}
     \`\${fmt(S.status.conflict)} medidores apresentaram conflito (o moduleId do conteúdo mudou ao longo do tempo), o que corresponde a \${pct(S.status.conflict, S.analyzed)} dos analisados. \${fmt(S.metersWithAnomalies)} medidores têm pelo menos uma anomalia (\${fmt(S.anomalyRows)} registros): \${AT.map((k) => AL[k] + " " + fmt(S.anomalies[k] || 0)).join(", ")}.\`,
     \`\${fmt(S.status.no_records)} medidores não têm nenhum registro de auto-registro; \${fmt(S.status.no_module_id)} têm registros mas nenhum com moduleId; \${fmt(S.status.ok)} são consistentes sem anomalias e \${fmt(S.status.ok_anomalies)} consistentes com anomalias. No total foram lidos \${fmt(S.recordsTotal)} registros (\${fmt(S.successes)} com sucesso, \${fmt(S.failures)} com falha).\`,
   ]);
-  $("runInfo").textContent = \`Fonte: \${S.source || "?"}\${S.schema ? " · schema " + S.schema : ""} · início \${S.startedAt || "?"} · última atualização \${S.updatedAt || "?"} · dashboard gerado em \${S.generatedAt}\`;
+  $("runInfo").textContent = \`Fonte: \${S.store || S.source || "?"}\${S.schema ? " · lista de medidores: mysql " + S.schema : ""} · início \${S.startedAt || "?"} · última atualização \${S.updatedAt || "?"} · dashboard gerado em \${S.generatedAt}\`;
 
   $("btnXlsx").addEventListener("click", () => {
     if (typeof XLSX === "undefined") { alert("Biblioteca XLSX não carregada (sem vendor/xlsx.full.min.js e sem internet)."); return; }
@@ -1081,6 +1249,40 @@ ${vendorTags}
 `;
 }
 
+// ───────────────────────────────────────────────────────────── probe (connectivity + document shape)
+async function cmdProbe(args) {
+  const meterNo = args.meter ? String(args.meter) : null;
+  // MySQL (meter list)
+  try {
+    const schema = await detectAmiSchema(args.db);
+    const db = mysqlSession(schema);
+    const [{ n }] = await db.query('SELECT COUNT(*) AS n FROM archive_meter WHERE delete_flag = 0', [], 1);
+    const [row] = await db.query('SELECT meter_no AS meterNo, dcu_no AS dcuNo FROM archive_meter WHERE delete_flag = 0 LIMIT 1', [], 1);
+    await db.close();
+    log(`mysql OK: schema ${schema} · archive_meter has ${n} active meters (e.g. ${row?.meterNo})`);
+  } catch (err) { log(`mysql FAILED: ${err.message}`); }
+  // Mongo (records)
+  let mongo = null;
+  try {
+    mongo = await mongoSession(args['mongo-uri'] || DEFAULT_MONGO_URI, args['mongo-db'] || DEFAULT_MONGO_DB);
+    const cols = await resolveRegisterCollections(mongo, { explicit: args.collections, from: args.from, to: args.to });
+    const latest = cols[cols.length - 1];
+    const info = await mongoCollectionInfo(mongo, latest.name);
+    const count = await mongo.db.collection(latest.name).estimatedDocumentCount();
+    const sample = await mongo.db.collection(latest.name).findOne({}, { projection: MONGO_PROJECTION });
+    log(`mongo OK: ${cols.length} collections · ${latest.name} has ~${count} documents · meter field ${info.meterField} · time stored as ${info.timeIsDate ? 'Date' : 'string'}`);
+    if (sample) log(`sample document (${latest.name}): ${JSON.stringify(normalizeMongoRow(sample)).slice(0, 600)}`);
+    if (meterNo) {
+      const byMeter = await fetchRecordsMongo(mongo, [meterNo], cols);
+      const rows = byMeter.get(meterNo) || [];
+      const res = analyzeMeter({ meterNo }, rows, { maxSamples: 5, maxTimeline: 20 });
+      log(`meter ${meterNo}: ${rows.length} records from ${res.firstAt ?? '-'} to ${res.lastAt ?? '-'} · status ${res.status} · moduleId ${res.moduleId ?? '-'}${res.conflict ? ` · conflict at ${res.conflict.at}: ${res.conflict.previousModuleId} → ${res.conflict.newModuleId}` : ''} · anomalies ${res.anomalyTotal}`);
+      for (const r of rows.slice(-5)) log(`  ${r.registerTime} · status ${r.registerStatus} · moduleId ${parseContent(r.registerMsg).moduleId ?? '-'} · via ${r.upperDeviceNo ?? '-'}`);
+    }
+  } catch (err) { log(`mongo FAILED: ${err.message}`); }
+  finally { await mongo?.close(); }
+}
+
 // ───────────────────────────────────────────────────────────── main
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -1091,10 +1293,11 @@ async function main() {
     case 'build': await cmdBuild(args); break;
     case 'status': await cmdStatus(); break;
     case 'reset': cmdReset(args); break;
-    default: console.log('usage: node audit.mjs run|build|status|reset [options] (see header of this file)'); process.exit(2);
+    case 'probe': await cmdProbe(args); break;
+    default: console.log('usage: node audit.mjs run|build|status|reset|probe [options] (see header of this file)'); process.exit(2);
   }
 }
 
-export { analyzeMeter, parseContent, summarize, STATUS, ANOMALY_TYPES, mysqlSession, detectAmiSchema, readJsonl, readJson, writeJsonAtomic, localStamp, normTime, trimStr, nowIso, ensureDirs, STATE_DIR, OUTPUT_DIR, DEFAULT_AMI_SCHEMA };
+export { analyzeMeter, parseContent, summarize, resolveRegisterTables, fetchRecordsMysql, ObjectId, mongoSession, mongoCollectionInfo, mongoTimeBound, MONGO_PROJECTION, resolveRegisterCollections, fetchRecordsMongo, normalizeMongoRow, mongoMeterField, suffixWindow, DEFAULT_MONGO_URI, DEFAULT_MONGO_DB, BASE_TABLE, STATUS, ANOMALY_TYPES, mysqlSession, detectAmiSchema, readJsonl, readJson, writeJsonAtomic, localStamp, normTime, trimStr, nowIso, ensureDirs, STATE_DIR, OUTPUT_DIR, DEFAULT_AMI_SCHEMA };
 
 if (!process.env.AUDIT_NO_MAIN) main().catch((err) => { log(`FATAL: ${err.stack || err.message || err}`); process.exit(1); });

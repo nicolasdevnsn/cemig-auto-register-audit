@@ -12,6 +12,7 @@
   "dependencies": {
     "chart.js": "4.4.1",
     "exceljs": "^4.4.0",
+    "mongodb": "^6.21.0",
     "mysql2": "^3.14.1",
     "xlsx": "0.18.5"
   }
