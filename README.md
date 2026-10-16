@@ -36,15 +36,13 @@ through the same MDC login cemig-ext-data uses, stored locally, and analysed off
 needed for the records (the meter list still comes from MySQL `archive_meter`, or from a file with `--meters file`).
 
 ```powershell
-node audit.mjs fetch-api --from 2024-01-01          # resumable; Ctrl+C and run again to continue (state\api-fetch\)
+node audit.mjs fetch-api                            # from 2020-01-01 to yesterday; resumable (Ctrl+C, run again)
 node audit.mjs run --source jsonl                   # rule per meter from the local shards -> dashboard + xlsx
 node module-ids.mjs run                             # moduleId list from the same shards (default --source jsonl)
 node audit.mjs status                               # shows the scan cursor and the analysis progress
 ```
 
-fetch-api options: `--from`/`--to` (dates), `--window` hours per request window (24), `--size` rows per page (500),
-`--shards` (64), `--limit-windows N`. Each request is one PowerShell call (about 1-2 s). Note: the MDC login
-invalidates other sessions of the shared SanPlat account.
+fetch-api options: `--from` (default 2020-01-01) / `--to` (default yesterday 23:59:59, so no window is still being written while it is paged), `--window` base hours per request (6), `--max-window` (720 h = 30 days), `--size` rows per page (500; a server cap is detected), `--shards` (64), `--limit-windows N`. **Adaptive window**: while windows come back empty the next one doubles (6 h, 12 h, … up to 30 days), so the years before the meters existed cost a few dozen requests instead of thousands; the first window with data drops back to 6 h, and a grown window that would need more than one page is split back down before anything is stored. The log reports "first records found in the window starting …" and, at the end, how many windows were empty. Each request is one PowerShell call (about 1-2 s). Note: the MDC login invalidates other sessions of the shared SanPlat account.
 
 ## Usage
 
@@ -166,3 +164,12 @@ URL-encoded automatically; in a hand-written `--mongo-uri` you must encode them 
 Copy `.env.example` to `.env` (git-ignored) to override, for this project only, what comes from `..\cemig-ext-data\.env`:
 `ACCOUNT` / `SANPLAT_PASSWORD` for the MDC login used by `fetch-api`, `MONGO_*`, `AUDIT_SSH_PASS`. It is loaded first,
 so its values win; the collector's own file is never modified.
+
+#### Pagination notes (API scan)
+
+- A window is `[start, start + window - 1 s]`; windows are contiguous, so a row belongs to exactly one window.
+- Pages are driven by the server's `pageCount`; without it, by `count` and the page size the server actually returned.
+- The checkpoint is written after the rows of a page are appended, so an interruption can re-fetch one page; rows are
+  deduplicated by their `id` when the analysis loads the shards.
+- The server does not guarantee a stable order inside a window, so only multi-page windows can miss a row at a page
+  boundary. The scan counts them and warns at the end; use a smaller `--window` if that number is significant.

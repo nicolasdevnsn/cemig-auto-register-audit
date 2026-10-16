@@ -17,7 +17,7 @@
  * dashboard and exits. Run again to continue from where it stopped.
  *
  * Commands
- *   node audit.mjs fetch-api [--from 2024-01-01] [--to 2026-10-16] [--window 24] [--size 500] [--limit-windows N]
+ *   node audit.mjs fetch-api [--from 2020-01-01] [--to <yesterday>] [--window 6] [--max-window 720] [--size 500] [--limit-windows N]
  *                         pull the whole history through the screen's endpoint (MDC login) into state/api-fetch/ shards
  *   node audit.mjs run --source jsonl                   analyse from those shards (no DB needed) ← RECOMMENDED PATH
  *   node audit.mjs run    [--source jsonl|mongo|mysql|api] [--db <ami schema>] [--meters mysql|api|file]
@@ -713,12 +713,27 @@ function shardOf(meterNo, shards) {   // FNV-1a
   return h % shards;
 }
 const addSeconds = (stamp, s) => { const d = new Date(stamp.replace(' ', 'T')); d.setSeconds(d.getSeconds() + s); return localStamp(d); };
+// [registerTime, deviceNo, deviceCategory, registerStatus, registerResult, registerMsg, upperDeviceNo, upperDeviceType, id, ip, port, macAddress]
 function normalizeApiRow(c, fallbackMeter = null) {
   return [normTime(c.registerTime ?? c.register_time), trimStr(c.deviceNo ?? c.device_no ?? fallbackMeter), c.deviceCategory ?? c.device_category ?? null, c.registerStatus ?? c.register_status ?? null,
-    c.registerResult ?? c.register_result ?? null, c.registerMsg ?? c.register_msg ?? null, c.lastUpperDeviceNo ?? c.upperDeviceNo ?? c.upper_device_no ?? null, c.lastUpperDeviceType ?? c.upperDeviceType ?? c.upper_device_type ?? null, c.id ?? null];
+    c.registerResult ?? c.register_result ?? null, c.registerMsg ?? c.register_msg ?? null, c.lastUpperDeviceNo ?? c.upperDeviceNo ?? c.upper_device_no ?? null, c.lastUpperDeviceType ?? c.upperDeviceType ?? c.upper_device_type ?? null, c.id ?? null,
+    c.ip ?? null, c.port ?? null, c.macAddress ?? c.mac_address ?? null];
 }
 const pageContent = (result) => (Array.isArray(result) ? result : (result?.content ?? result?.list ?? result?.records ?? result?.rows ?? []));
-const pageCountOf = (result, page, got, size) => Number(result?.pageCount ?? result?.totalPages ?? result?.pages ?? (got < size ? page : page + 1));
+/**
+ * Pages in a window. Trusts the server's pageCount when present; otherwise derives it from the total count and the
+ * page size the server ACTUALLY returned (it may cap --size), and only as a last resort from "fewer rows than asked".
+ */
+function pageCountOf(result, page, got, size, effectiveSize) {
+  const explicit = result?.pageCount ?? result?.totalPages ?? result?.pages;
+  if (explicit !== undefined && explicit !== null && Number(explicit) > 0) return Number(explicit);
+  const total = result?.count ?? result?.total ?? result?.totalElements ?? result?.totalCount;
+  const eff = Math.max(effectiveSize || 0, got);
+  if (total !== undefined && total !== null && eff > 0) return Math.max(1, Math.ceil(Number(total) / eff));
+  return got < (effectiveSize || size) ? page : page + 1;
+}
+/** 'YYYY-MM-DD' -> start or end of that day; full stamps pass through. */
+function dayBound(v, end) { const str = String(v).trim(); return str.length <= 10 ? `${str} ${end ? '23:59:59' : '00:00:00'}` : normTime(str); }
 
 async function cmdFetchApi(args, requestFn = null) {
   ensureDirs(); mkdirSync(API_FETCH_DIR, { recursive: true });
@@ -726,25 +741,34 @@ async function cmdFetchApi(args, requestFn = null) {
   const { config } = requestFn ? { config: { CEMIG_MDC_URL: 'http://mock' } } : await loadExt();
   const api = requestFn ? { request: requestFn } : apiSession();
   const progress = readJson(API_FETCH_PROGRESS, null) || {
-    from: normTime(args.from ? String(args.from).padEnd(19, ' 00:00:00'.slice(String(args.from).length - 10)) : '2024-01-01 00:00:00'),
-    to: normTime(args.to ? String(args.to).padEnd(19, ' 23:59:59'.slice(String(args.to).length - 10)) : localStamp()),
-    windowHours: Number(args.window) || 24, size: Number(args.size) || 500, shards: Number(args.shards) || 64,
-    cursor: null, page: 1, rowsRead: 0, requests: 0, windowsDone: 0, startedAt: nowIso(), runs: 0,
+    from: args.from ? dayBound(args.from, false) : '2020-01-01 00:00:00',
+    // default end = yesterday 23:59:59: a window that is still receiving rows cannot be paged consistently
+    to: args.to ? dayBound(args.to, true) : dayBound(localStamp(new Date(Date.now() - 86400000)).slice(0, 10), true),
+    windowHours: Number(args.window) || 6, maxWindowHours: Number(args['max-window']) || 720, size: Number(args.size) || 500, shards: Number(args.shards) || 64,
+    cursor: null, page: 1, windowHoursCurrent: Number(args.window) || 6, rowsRead: 0, requests: 0, windowsDone: 0, windowsEmpty: 0, windowsMultiPage: 0, firstRowAt: null,
+    effectiveSize: null, keysLogged: false, startedAt: nowIso(), runs: 0,
   };
   if (progress.cursor === null) progress.cursor = progress.from;
   progress.runs++; progress.updatedAt = nowIso(); delete progress.finishedAt;
   writeJsonAtomic(API_FETCH_PROGRESS, progress);
   const limitWindows = args['limit-windows'] !== undefined ? Number(args['limit-windows']) : Infinity;
-  log(`fetch-api: window ${progress.from} .. ${progress.to} in steps of ${progress.windowHours} h, ${progress.size} rows/page, ${progress.shards} shards · resuming at ${progress.cursor} page ${progress.page} · ${progress.rowsRead} rows so far`);
+  progress.windowHoursCurrent = progress.windowHoursCurrent || progress.windowHours;
+  log(`fetch-api: window ${progress.from} .. ${progress.to} in steps of ${progress.windowHours} h (growing up to ${progress.maxWindowHours} h while empty), ${progress.size} rows/page, ${progress.shards} shards · resuming at ${progress.cursor} page ${progress.page} (window ${progress.windowHoursCurrent} h) · ${progress.rowsRead} rows so far${progress.firstRowAt ? ` · first records at ${progress.firstRowAt}` : ''}`);
   const t0 = Date.now(); let rowsThisRun = 0, windowsThisRun = 0, errors = 0;
   while (!stopRequested && windowsThisRun < limitWindows) {
     if (progress.cursor > progress.to) { progress.finishedAt = nowIso(); writeJsonAtomic(API_FETCH_PROGRESS, progress); log('fetch-api: whole window fetched'); break; }
     const startTime = progress.cursor;
-    const endTime = addSeconds(startTime, progress.windowHours * 3600 - 1) > progress.to ? progress.to : addSeconds(startTime, progress.windowHours * 3600 - 1);
+    const span = progress.page > 1 ? (progress.spanPaging || progress.windowHours) : progress.windowHoursCurrent;   // while paging, keep the span page 1 used
+    const rawEnd = addSeconds(startTime, span * 3600 - 1);
+    const endTime = rawEnd > progress.to ? progress.to : rawEnd;
     const params = new URLSearchParams({ startTime, endTime, page: String(progress.page), size: String(progress.size) });
     const url = `${config.CEMIG_MDC_URL}/ami/collection/V1/register/result?${params}`;
     let data;
     try { data = await api.request(url); errors = 0; } catch (err) {
+      if (span > progress.windowHours) {   // a wide window may be refused by the server: fall back to the base window, not an error
+        log(`fetch-api: ${startTime} (${span} h window): ${err.message || err} — retrying with the base window of ${progress.windowHours} h`);
+        progress.windowHoursCurrent = progress.windowHours; writeJsonAtomic(API_FETCH_PROGRESS, progress); continue;
+      }
       errors++; log(`fetch-api: ${startTime} p${progress.page}: error ${errors}/${DEFAULTS.maxConsecutiveErrors} — ${err.message || err}`);
       if (errors >= DEFAULTS.maxConsecutiveErrors) throw new Error('fetch-api: too many consecutive API errors — run again to resume');
       await sleep(Math.min(60000, 5000 * errors)); continue;
@@ -752,20 +776,39 @@ async function cmdFetchApi(args, requestFn = null) {
     progress.requests++;
     const result = data?.result ?? data;
     const content = pageContent(result);
-    if (progress.page === 1 && progress.windowsDone === 0 && content.length) log(`fetch-api: first row keys: ${Object.keys(content[0]).join(', ')}`);
+    // adaptive window: a wide (grown) window that does not fit in one page is split back down and re-fetched,
+    // so pages are only ever walked inside a base-size window (stable, and nothing is appended twice)
+    if (span > progress.windowHours && pageCountOf(result, 1, content.length, progress.size, progress.effectiveSize) > 1) {
+      const next = Math.max(progress.windowHours, Math.floor(span / 2));
+      log(`fetch-api: ${startTime} .. ${endTime} (${span} h) has more than one page — splitting to ${next} h`);
+      progress.windowHoursCurrent = next; writeJsonAtomic(API_FETCH_PROGRESS, progress); continue;
+    }
+    if (content.length && !progress.firstRowAt) { progress.firstRowAt = startTime; log(`fetch-api: first records found in the window starting ${startTime}`); }
+    if (!progress.keysLogged && content.length) { progress.keysLogged = true; log(`fetch-api: row keys: ${Object.keys(content[0]).join(', ')}`); }
+    if (content.length && (!progress.effectiveSize || content.length > progress.effectiveSize)) {
+      progress.effectiveSize = content.length;
+      if (content.length < progress.size && (pageContent(result).length === content.length) && (result?.pageCount ?? result?.totalPages ?? result?.pages ?? 2) > 1) log(`fetch-api: server returns at most ${content.length} rows per page (asked ${progress.size})`);
+    }
     const byShard = new Map();
     for (const c of content) { const row = normalizeApiRow(c); if (!row[1]) continue; const s = shardOf(row[1], progress.shards); (byShard.get(s) || byShard.set(s, []).get(s)).push(JSON.stringify(row)); }
     for (const [s, lines] of byShard) appendFileSync(SHARD_FILE(s), lines.join('\n') + '\n', 'utf8');   // rows first ...
-    const pageCount = pageCountOf(result, progress.page, content.length, progress.size);
+    const pageCount = pageCountOf(result, progress.page, content.length, progress.size, progress.effectiveSize);
     const windowDone = !content.length || progress.page >= pageCount;
     progress.rowsRead += content.length; rowsThisRun += content.length;
-    if (windowDone) { progress.windowsDone++; windowsThisRun++; progress.cursor = addSeconds(endTime, 1); progress.page = 1; } else progress.page++;
+    if (windowDone) {
+      if (progress.page > 1) progress.windowsMultiPage++;
+      if (!content.length && progress.page === 1) { progress.windowsEmpty++; progress.windowHoursCurrent = Math.min(progress.maxWindowHours, span * 2); }   // empty: grow
+      else progress.windowHoursCurrent = progress.windowHours;                                                                                       // data: back to base
+      progress.windowsDone++; windowsThisRun++; progress.cursor = addSeconds(endTime, 1); progress.page = 1;
+    } else { progress.page++; progress.spanPaging = span; }
     progress.updatedAt = nowIso();
     writeJsonAtomic(API_FETCH_PROGRESS, progress);                                                    // ... then the checkpoint
     const elapsed = (Date.now() - t0) / 1000;
-    log(`fetch-api: ${startTime} .. ${endTime} page ${windowDone ? pageCount : progress.page - 1}/${pageCount}: ${content.length} rows${windowDone ? ' · window done' : ''} · total ${progress.rowsRead} rows in ${progress.requests} requests · ${(rowsThisRun / Math.max(1, elapsed)).toFixed(0)} rows/s`);
+    log(`fetch-api: ${startTime} .. ${endTime} (${span} h) page ${windowDone ? pageCount : progress.page - 1}/${pageCount}: ${content.length} rows${windowDone ? (content.length ? ' · window done' : ` · empty, next window ${progress.windowHoursCurrent} h`) : ''} · total ${progress.rowsRead} rows in ${progress.requests} requests · ${(rowsThisRun / Math.max(1, elapsed)).toFixed(0)} rows/s`);
   }
   if (!progress.finishedAt) log(stopRequested ? 'fetch-api: stopped by request — run again to continue' : 'fetch-api: stopped after --limit-windows');
+  log(`fetch-api: ${progress.windowsDone} windows done, ${progress.windowsEmpty} empty${progress.firstRowAt ? `, first records at ${progress.firstRowAt}` : ', no records found yet'}`);
+  if (progress.windowsMultiPage) log(`fetch-api: ${progress.windowsMultiPage} of ${progress.windowsDone} windows needed more than one page. The server does not guarantee a stable order inside a window, so a row at a page boundary can be missed; a smaller --window (hours) keeps windows to one page.`);
   return progress;
 }
 
@@ -776,7 +819,7 @@ async function loadShardRows(i) {
     if (!Array.isArray(r) || !r[1]) continue;
     const key = r[8] ? `${r[1]}|${r[8]}` : `${r[1]}|${r[0]}|${r[5] ?? ''}`;   // id when the API gives one, else time+content
     if (seen.has(key)) continue; seen.add(key);
-    const row = { id: r[8] ?? '', deviceNo: r[1], deviceCategory: r[2], registerTime: r[0], registerStatus: r[3], registerResult: r[4], registerMsg: r[5], upperDeviceNo: r[6], upperDeviceType: r[7], ip: null, port: null, macAddress: null };
+    const row = { id: r[8] ?? '', deviceNo: r[1], deviceCategory: r[2], registerTime: r[0], registerStatus: r[3], registerResult: r[4], registerMsg: r[5], upperDeviceNo: r[6], upperDeviceType: r[7], ip: r[9] ?? null, port: r[10] ?? null, macAddress: r[11] ?? null };
     (byMeter.get(r[1]) || byMeter.set(r[1], []).get(r[1])).push(row);
   }
   for (const list of byMeter.values()) list.sort((a, b) => (a.registerTime || '').localeCompare(b.registerTime || '') || String(a.id).localeCompare(String(b.id)));
@@ -795,7 +838,7 @@ async function runFromJsonl(meters, progress, opts, args) {
     const s = progress.shardIndex; const byMeter = await loadShardRows(s); const list = metersByShard.get(s) || [];
     const lines = []; let conflicts = 0, anomalies = 0, noRecords = 0, records = 0;
     for (const m of list) { const rows = byMeter.get(m.meterNo) || []; const res = analyzeMeter(m, rows, opts); records += rows.length; if (res.status === 'conflict') conflicts++; if (res.status === 'no_records') noRecords++; if (res.anomalyTotal) anomalies++; lines.push(JSON.stringify(res)); }
-    const unknown = [...byMeter.keys()].filter((no) => !list.some((m) => m.meterNo === no)).length;
+    const listed = new Set(list.map((m) => m.meterNo)); let unknown = 0; for (const no of byMeter.keys()) if (!listed.has(no)) unknown++;
     if (lines.length) appendFileSync(F.results, lines.join('\n') + '\n', 'utf8');
     progress.shardIndex++; progress.processed += list.length; progress.nextIndex = progress.processed; progress.updatedAt = nowIso();
     writeJsonAtomic(F.progress, progress);
