@@ -29,6 +29,23 @@ run again to continue from the next meter.
 - `../cemig-ext-data` with its `.env` (credentials, MySQL config, client certificate) – reused as is.
 - CEMIG VPN.
 
+## Recommended path: API scan (works wherever the MDC login works)
+
+The screen's endpoint accepts a time window without a meter number, so the whole history is pulled page by page
+through the same MDC login cemig-ext-data uses, stored locally, and analysed offline. No MySQL/Mongo access is
+needed for the records (the meter list still comes from MySQL `archive_meter`, or from a file with `--meters file`).
+
+```powershell
+node audit.mjs fetch-api --from 2024-01-01          # resumable; Ctrl+C and run again to continue (state\api-fetch\)
+node audit.mjs run --source jsonl                   # rule per meter from the local shards -> dashboard + xlsx
+node module-ids.mjs run                             # moduleId list from the same shards (default --source jsonl)
+node audit.mjs status                               # shows the scan cursor and the analysis progress
+```
+
+fetch-api options: `--from`/`--to` (dates), `--window` hours per request window (24), `--size` rows per page (500),
+`--shards` (64), `--limit-windows N`. Each request is one PowerShell call (about 1-2 s). Note: the MDC login
+invalidates other sessions of the shared SanPlat account.
+
 ## Usage
 
 ```powershell
@@ -122,10 +139,30 @@ node module-ids.mjs run --tunnel
 ### Finding the AMI Mongo from the jump host
 
 ```powershell
-node probe.mjs --ssh-scan            # no manual plink needed: uses cemig-ext-data's SSH_HOST/SSH_USER/SSH_PASS + plink
+node probe.mjs --ssh-scan [--ssh-user u --ssh-pass p]   # uses cemig-ext-data SSH_HOST/SSH_USER/SSH_PASS + plink, exactly like its RocketMQ job
 ```
 
 Runs read-only commands on 10.30.104.40 and prints: mongo settings found in SanPlat config files and running java
 processes, established connections to port 27017, TCP reachability of candidate hosts (10.30.132.30, 10.30.104.31,
 .30, .60, .66, .71 and `--hosts a,b`), and the box's own addresses. Passwords are masked. Then use the host it reveals with
 `--mongo-uri` or `--tunnel host:27017`.
+
+### Mongo credentials
+
+If the AMI Mongo requires authentication (SanPlat connects as user `ami`, auth database = the data database), pass them
+at run time; nothing is stored in this project:
+
+```powershell
+$env:MONGO_USER = "ami"; $env:MONGO_PASS = "<password>"          # or add MONGO_USER/MONGO_PASS to ..\cemig-ext-data\.env
+node probe.mjs --tunnel
+node audit.mjs run --tunnel
+```
+
+Flags `--mongo-user`, `--mongo-pass`, `--auth-source` override the environment. Special characters in the password are
+URL-encoded automatically; in a hand-written `--mongo-uri` you must encode them yourself.
+
+### Local overrides (`.env` in this folder)
+
+Copy `.env.example` to `.env` (git-ignored) to override, for this project only, what comes from `..\cemig-ext-data\.env`:
+`ACCOUNT` / `SANPLAT_PASSWORD` for the MDC login used by `fetch-api`, `MONGO_*`, `AUDIT_SSH_PASS`. It is loaded first,
+so its values win; the collector's own file is never modified.

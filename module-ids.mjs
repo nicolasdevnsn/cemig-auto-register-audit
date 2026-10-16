@@ -61,8 +61,29 @@ async function cmdRun(args) {
   const batch = Number(args.batch) || DEFAULTS.batch;
   const limitBatches = args['limit-batches'] !== undefined ? Number(args['limit-batches']) : Infinity;
   const category = args.category ? String(args.category) : null;
-  const source = String(args.source || 'mongo');
-  if (!['mongo', 'mysql'].includes(source)) throw new Error('--source must be mongo or mysql');
+  const source = String(args.source || 'jsonl');
+  if (!['jsonl', 'mongo', 'mysql'].includes(source)) throw new Error('--source must be jsonl, mongo or mysql');
+  if (source === 'jsonl') {
+    // from the local API scan (node audit.mjs fetch-api): convert every shard into this script's row format, then build
+    const fp = A.readJson(A.API_FETCH_PROGRESS, null);
+    if (!fp) throw new Error('no API scan found — run `node audit.mjs fetch-api` first');
+    if (existsSync(F.rows)) unlinkSync(F.rows);
+    let rows = 0;
+    for (let s = 0; s < fp.shards; s++) {
+      const byMeter = await A.loadShardRows(s);
+      const lines = [];
+      for (const list of byMeter.values()) for (const r of list) {
+        const c = A.parseContent(r.registerMsg);
+        lines.push(JSON.stringify([r.registerTime, r.deviceNo, c.moduleId || null, c.anomaly, A.trimStr(r.registerStatus), r.deviceCategory, r.upperDeviceNo || null, c.json?.meterNo ?? null, `shard-${s}`]));
+      }
+      if (lines.length) appendFileSync(F.rows, lines.join('\n') + '\n', 'utf8');
+      rows += lines.length;
+    }
+    A.writeJsonAtomic(F.progress, { source, tables: [`api scan ${fp.from} .. ${fp.to}`], tableIndex: 1, rowsRead: rows, batches: fp.shards, startedAt: A.nowIso(), updatedAt: A.nowIso(), finishedAt: A.nowIso(), runs: 1 });
+    log(`module-ids: ${rows} rows taken from the API scan (${fp.shards} shards${fp.finishedAt ? '' : ', scan not finished yet'})`);
+    if (args.build !== false) await cmdBuild();
+    return;
+  }
   const schema = source === 'mysql' ? await A.detectAmiSchema(args.db) : null;
   const progress = A.readJson(F.progress, { source, tables: null, tableIndex: 0, lastId: null, lastIdIsOid: false, lastTime: null, rowsRead: 0, rowsWithModuleId: 0, batches: 0, startedAt: A.nowIso(), runs: 0 });
   if (progress.source && progress.source !== source) throw new Error(`state was started with --source ${progress.source}; run reset --yes to switch to ${source}`);
@@ -70,7 +91,7 @@ async function cmdRun(args) {
   progress.schema = schema; progress.category = progress.category ?? category; progress.runs++; delete progress.finishedAt;
 
   const db = source === 'mysql' ? A.mysqlSession(schema) : null;
-  const mongo = source === 'mongo' ? await A.mongoSession(args['mongo-uri'] || null, args['mongo-db'] || A.DEFAULT_MONGO_DB, { tunnel: args.tunnel || null }) : null;
+  const mongo = source === 'mongo' ? await A.mongoSession(args['mongo-uri'] || null, args['mongo-db'] || A.DEFAULT_MONGO_DB, { tunnel: args.tunnel || null, sshArgs: args }) : null;
   const t0 = Date.now(); let batchesThisRun = 0; let rowsThisRun = 0;
   try {
     // ops_auto_register is split into monthly physical collections/tables (ops_auto_register_yyyyMM); the list is

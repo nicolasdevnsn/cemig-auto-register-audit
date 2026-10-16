@@ -17,10 +17,15 @@
  * dashboard and exits. Run again to continue from where it stopped.
  *
  * Commands
- *   node audit.mjs run    [--source mysql|api] [--db <ami schema>] [--meters mysql|api|file]
+ *   node audit.mjs fetch-api [--from 2024-01-01] [--to 2026-10-16] [--window 24] [--size 500] [--limit-windows N]
+ *                         pull the whole history through the screen's endpoint (MDC login) into state/api-fetch/ shards
+ *   node audit.mjs run --source jsonl                   analyse from those shards (no DB needed) ← RECOMMENDED PATH
+ *   node audit.mjs run    [--source jsonl|mongo|mysql|api] [--db <ami schema>] [--meters mysql|api|file]
  *                         [--meters-file list.txt] [--batch 200] [--limit N] [--no-build]
  *                         [--collections ops_auto_register_202608,...] [--from 'YYYY-MM-DD'] [--to 'YYYY-MM-DD']
  *                         [--mongo-uri mongodb://host:27017/?directConnection=true] [--mongo-db ami] [--tunnel [host:port]]
+ *   --mongo-user/--mongo-pass/--auth-source (or MONGO_USER/MONGO_PASS/MONGO_AUTH_SOURCE in env or cemig-ext-data/.env):
+ *                           Mongo credentials (SanPlat user is 'ami'; auth database defaults to the data db). Never stored here.
  *   --tunnel              : SSH port-forward to the AMI Mongo through the cemig-ext-data jump host (SSH_HOST in its .env,
  *                           plink). Default target 10.30.132.30:27017; use when only 10.30.104.x is routable.
  *
@@ -186,6 +191,10 @@ async function* readJsonl(file) {
 let ext = null;
 async function loadExt() {
   if (ext) return ext;
+  // this project's own .env (git-ignored) is loaded FIRST: loadEnvFile never overwrites variables that are already
+  // set, so anything defined here (ACCOUNT, SANPLAT_PASSWORD, MONGO_*, AUDIT_SSH_PASS) wins over cemig-ext-data/.env
+  const localEnv = join(ROOT, '.env');
+  if (existsSync(localEnv)) { try { process.loadEnvFile(localEnv); log(`env: loaded local overrides from ${localEnv}`); } catch (err) { log(`env: cannot load ${localEnv}: ${err.message}`); } }
   const authPath = join(EXT_DATA_DIR, 'src', 'auth.js');
   const configPath = join(EXT_DATA_DIR, 'src', 'config.js');
   if (!existsSync(authPath) || !existsSync(configPath)) {
@@ -395,15 +404,14 @@ async function fetchRecordsMysql(db, meterNos, tables) {
  * for machines that reach 10.30.104.x but not the AMI Mongo subnet. Returns { localPort, close }.
  */
 let tunnelPortSeq = 27117;
-async function openSshTunnel(targetHostPort, localPort = tunnelPortSeq++) {   // a fresh local port per tunnel: a just-killed plink may still hold the previous one
+async function openSshTunnel(targetHostPort, localPort = tunnelPortSeq++, tunnelArgs = {}) {   // a fresh local port per tunnel: a just-killed plink may still hold the previous one
   const { spawn } = await import('node:child_process');
   const net = await import('node:net');
-  const { config } = await loadExt();
-  const plink = config.PLINK || 'C:\\Program Files\\PuTTY\\plink.exe';
-  if (!existsSync(plink)) throw new Error(`plink not found at ${plink} (install PuTTY or fix PLINK in cemig-ext-data/src/config.js)`);
-  const args = ['-batch', '-N', '-L', `127.0.0.1:${localPort}:${targetHostPort}`, '-pw', config.SSH_PASS, `${config.SSH_USER}@${config.SSH_HOST}`];
-  log(`tunnel: ${plink} -N -L 127.0.0.1:${localPort}:${targetHostPort} ${config.SSH_USER}@${config.SSH_HOST}`);
-  const child = spawn(plink, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  const ssh = await sshSettings(tunnelArgs);
+  // same cmd.exe command line shape as the collector (password in double quotes), plus -N -L for the forward
+  const cmdLine = `"${ssh.plink}" -batch -N -L 127.0.0.1:${localPort}:${targetHostPort} -pw "${ssh.pass}" ${ssh.user}@${ssh.host}`;
+  log(`tunnel: plink -N -L 127.0.0.1:${localPort}:${targetHostPort} ${ssh.user}@${ssh.host}`);
+  const child = spawn(cmdLine, { shell: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   let stderr = ''; child.stderr.on('data', (d) => { stderr += d.toString(); });
   let exited = false; child.on('exit', (code) => { exited = true; if (code) log(`tunnel: plink exited with code ${code}: ${stderr.trim().slice(0, 300)}`); });
   const ready = await new Promise((resolve) => {
@@ -415,7 +423,7 @@ async function openSshTunnel(targetHostPort, localPort = tunnelPortSeq++) {   //
     };
     setTimeout(tryConnect, 800);
   });
-  if (!ready) { try { child.kill(); } catch { /* ignore */ } throw new Error(`tunnel to ${targetHostPort} via ${config.SSH_HOST} did not come up: ${stderr.trim().slice(0, 300) || 'no response on local port'}`); }
+  if (!ready) { try { child.kill(); } catch { /* ignore */ } throw new Error(`tunnel to ${targetHostPort} via ${ssh.host} did not come up: ${stderr.trim().slice(0, 300) || 'no response on local port'}`); }
   log(`tunnel: up on 127.0.0.1:${localPort}`);
   return { localPort, close: () => { try { child.kill(); } catch { /* ignore */ } } };
 }
@@ -425,15 +433,32 @@ async function openSshTunnel(targetHostPort, localPort = tunnelPortSeq++) {   //
  * (primary first, then secondary) so a machine that only routes to one subnet still gets through.
  * With tunnel = true (or a "host:port" string) the connection goes through openSshTunnel().
  */
-async function mongoSession(uri = null, dbName = DEFAULT_MONGO_DB, { tunnel = null } = {}) {
+/**
+ * Credentials (never stored in this project): --mongo-user/--mongo-pass/--auth-source, or MONGO_USER/MONGO_PASS/
+ * MONGO_AUTH_SOURCE in the environment or in cemig-ext-data/.env. SanPlat's own URI template is
+ * mongodb://<user>:<pwd>@<host>:<port>/<db>, i.e. the auth database is the data database (default here: dbName).
+ */
+function mongoCredentials(cliArgs = {}, dbName = DEFAULT_MONGO_DB) {
+  const user = cliArgs['mongo-user'] || process.env.MONGO_USER || null;
+  const pass = cliArgs['mongo-pass'] || process.env.MONGO_PASS || null;
+  const authSource = cliArgs['auth-source'] || process.env.MONGO_AUTH_SOURCE || dbName;
+  if (!user || !pass) return null;
+  return { user, pass, authSource, prefix: `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@`, query: `&authSource=${encodeURIComponent(authSource)}` };
+}
+
+async function mongoSession(uri = null, dbName = DEFAULT_MONGO_DB, { tunnel = null, sshArgs = {} } = {}) {
+  try { await loadExt(); } catch { /* cemig-ext-data not present: env vars / flags still work */ }   // loads cemig-ext-data/.env into process.env
   const explicit = uri || process.env.MONGO_URI || null;
-  let candidates = explicit ? [explicit] : DEFAULT_MONGO_HOSTS.map((h) => `mongodb://${h}/${dbName}?directConnection=true`);
+  const cred = mongoCredentials(sshArgs, dbName);
+  const build = (hostPort) => `mongodb://${cred ? cred.prefix : ''}${hostPort}/${dbName}?directConnection=true${cred ? cred.query : ''}`;
+  let candidates = explicit ? [explicit] : DEFAULT_MONGO_HOSTS.map(build);
   let tun = null;
   if (tunnel) {
     const target = typeof tunnel === 'string' && tunnel.includes(':') ? tunnel : (explicit ? new URL(explicit).host : DEFAULT_MONGO_HOSTS[1]);
-    tun = await openSshTunnel(target.includes(':') ? target : `${target}:27017`);
-    candidates = [`mongodb://127.0.0.1:${tun.localPort}/${dbName}?directConnection=true`];
+    tun = await openSshTunnel(target.includes(':') ? target : `${target}:27017`, undefined, sshArgs);
+    candidates = [build(`127.0.0.1:${tun.localPort}`)];
   }
+  if (cred) log(`mongo: authenticating as ${cred.user} (authSource ${cred.authSource})`);
   const failures = [];
   for (const cand of candidates) {
     const masked = cand.replace(/\/\/[^@]*@/, '//***@');
@@ -671,6 +696,116 @@ function analyzeMeter(meter, rows, opts) {
   return res;
 }
 
+// ───────────────────────────────────────────────────────────── API scan → local shards (the path that always works)
+/**
+ * The screen's endpoint accepts a time window WITHOUT deviceNo, so the whole history can be pulled page by page
+ * through the MDC login that cemig-ext-data already uses, without touching MySQL/Mongo for the records.
+ * Rows land in state/api-fetch/shard-NN.jsonl (shard = hash of the meter number), one JSON array per row:
+ *   [registerTime, deviceNo, deviceCategory, registerStatus, registerResult, registerMsg, upperDeviceNo, upperDeviceType, id]
+ * Resumable per page; windows are [start, start+window-1s] so nothing is double counted.
+ */
+const API_FETCH_DIR = join(STATE_DIR, 'api-fetch');
+const API_FETCH_PROGRESS = join(API_FETCH_DIR, 'progress.json');
+const SHARD_FILE = (i) => join(API_FETCH_DIR, `shard-${String(i).padStart(2, '0')}.jsonl`);
+function shardOf(meterNo, shards) {   // FNV-1a
+  let h = 0x811c9dc5;
+  for (let i = 0; i < meterNo.length; i++) { h ^= meterNo.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h % shards;
+}
+const addSeconds = (stamp, s) => { const d = new Date(stamp.replace(' ', 'T')); d.setSeconds(d.getSeconds() + s); return localStamp(d); };
+function normalizeApiRow(c, fallbackMeter = null) {
+  return [normTime(c.registerTime ?? c.register_time), trimStr(c.deviceNo ?? c.device_no ?? fallbackMeter), c.deviceCategory ?? c.device_category ?? null, c.registerStatus ?? c.register_status ?? null,
+    c.registerResult ?? c.register_result ?? null, c.registerMsg ?? c.register_msg ?? null, c.lastUpperDeviceNo ?? c.upperDeviceNo ?? c.upper_device_no ?? null, c.lastUpperDeviceType ?? c.upperDeviceType ?? c.upper_device_type ?? null, c.id ?? null];
+}
+const pageContent = (result) => (Array.isArray(result) ? result : (result?.content ?? result?.list ?? result?.records ?? result?.rows ?? []));
+const pageCountOf = (result, page, got, size) => Number(result?.pageCount ?? result?.totalPages ?? result?.pages ?? (got < size ? page : page + 1));
+
+async function cmdFetchApi(args, requestFn = null) {
+  ensureDirs(); mkdirSync(API_FETCH_DIR, { recursive: true });
+  installSignalHandlers();
+  const { config } = requestFn ? { config: { CEMIG_MDC_URL: 'http://mock' } } : await loadExt();
+  const api = requestFn ? { request: requestFn } : apiSession();
+  const progress = readJson(API_FETCH_PROGRESS, null) || {
+    from: normTime(args.from ? String(args.from).padEnd(19, ' 00:00:00'.slice(String(args.from).length - 10)) : '2024-01-01 00:00:00'),
+    to: normTime(args.to ? String(args.to).padEnd(19, ' 23:59:59'.slice(String(args.to).length - 10)) : localStamp()),
+    windowHours: Number(args.window) || 24, size: Number(args.size) || 500, shards: Number(args.shards) || 64,
+    cursor: null, page: 1, rowsRead: 0, requests: 0, windowsDone: 0, startedAt: nowIso(), runs: 0,
+  };
+  if (progress.cursor === null) progress.cursor = progress.from;
+  progress.runs++; progress.updatedAt = nowIso(); delete progress.finishedAt;
+  writeJsonAtomic(API_FETCH_PROGRESS, progress);
+  const limitWindows = args['limit-windows'] !== undefined ? Number(args['limit-windows']) : Infinity;
+  log(`fetch-api: window ${progress.from} .. ${progress.to} in steps of ${progress.windowHours} h, ${progress.size} rows/page, ${progress.shards} shards · resuming at ${progress.cursor} page ${progress.page} · ${progress.rowsRead} rows so far`);
+  const t0 = Date.now(); let rowsThisRun = 0, windowsThisRun = 0, errors = 0;
+  while (!stopRequested && windowsThisRun < limitWindows) {
+    if (progress.cursor > progress.to) { progress.finishedAt = nowIso(); writeJsonAtomic(API_FETCH_PROGRESS, progress); log('fetch-api: whole window fetched'); break; }
+    const startTime = progress.cursor;
+    const endTime = addSeconds(startTime, progress.windowHours * 3600 - 1) > progress.to ? progress.to : addSeconds(startTime, progress.windowHours * 3600 - 1);
+    const params = new URLSearchParams({ startTime, endTime, page: String(progress.page), size: String(progress.size) });
+    const url = `${config.CEMIG_MDC_URL}/ami/collection/V1/register/result?${params}`;
+    let data;
+    try { data = await api.request(url); errors = 0; } catch (err) {
+      errors++; log(`fetch-api: ${startTime} p${progress.page}: error ${errors}/${DEFAULTS.maxConsecutiveErrors} — ${err.message || err}`);
+      if (errors >= DEFAULTS.maxConsecutiveErrors) throw new Error('fetch-api: too many consecutive API errors — run again to resume');
+      await sleep(Math.min(60000, 5000 * errors)); continue;
+    }
+    progress.requests++;
+    const result = data?.result ?? data;
+    const content = pageContent(result);
+    if (progress.page === 1 && progress.windowsDone === 0 && content.length) log(`fetch-api: first row keys: ${Object.keys(content[0]).join(', ')}`);
+    const byShard = new Map();
+    for (const c of content) { const row = normalizeApiRow(c); if (!row[1]) continue; const s = shardOf(row[1], progress.shards); (byShard.get(s) || byShard.set(s, []).get(s)).push(JSON.stringify(row)); }
+    for (const [s, lines] of byShard) appendFileSync(SHARD_FILE(s), lines.join('\n') + '\n', 'utf8');   // rows first ...
+    const pageCount = pageCountOf(result, progress.page, content.length, progress.size);
+    const windowDone = !content.length || progress.page >= pageCount;
+    progress.rowsRead += content.length; rowsThisRun += content.length;
+    if (windowDone) { progress.windowsDone++; windowsThisRun++; progress.cursor = addSeconds(endTime, 1); progress.page = 1; } else progress.page++;
+    progress.updatedAt = nowIso();
+    writeJsonAtomic(API_FETCH_PROGRESS, progress);                                                    // ... then the checkpoint
+    const elapsed = (Date.now() - t0) / 1000;
+    log(`fetch-api: ${startTime} .. ${endTime} page ${windowDone ? pageCount : progress.page - 1}/${pageCount}: ${content.length} rows${windowDone ? ' · window done' : ''} · total ${progress.rowsRead} rows in ${progress.requests} requests · ${(rowsThisRun / Math.max(1, elapsed)).toFixed(0)} rows/s`);
+  }
+  if (!progress.finishedAt) log(stopRequested ? 'fetch-api: stopped by request — run again to continue' : 'fetch-api: stopped after --limit-windows');
+  return progress;
+}
+
+/** Reads one shard: Map meterNo -> rows (deduplicated, sorted by registerTime then id). */
+async function loadShardRows(i) {
+  const byMeter = new Map(); const seen = new Set();
+  for await (const r of readJsonl(SHARD_FILE(i))) {
+    if (!Array.isArray(r) || !r[1]) continue;
+    const key = r[8] ? `${r[1]}|${r[8]}` : `${r[1]}|${r[0]}|${r[5] ?? ''}`;   // id when the API gives one, else time+content
+    if (seen.has(key)) continue; seen.add(key);
+    const row = { id: r[8] ?? '', deviceNo: r[1], deviceCategory: r[2], registerTime: r[0], registerStatus: r[3], registerResult: r[4], registerMsg: r[5], upperDeviceNo: r[6], upperDeviceType: r[7], ip: null, port: null, macAddress: null };
+    (byMeter.get(r[1]) || byMeter.set(r[1], []).get(r[1])).push(row);
+  }
+  for (const list of byMeter.values()) list.sort((a, b) => (a.registerTime || '').localeCompare(b.registerTime || '') || String(a.id).localeCompare(String(b.id)));
+  return byMeter;
+}
+
+/** --source jsonl: analyse shard by shard from the local API scan; resumable by shard index. */
+async function runFromJsonl(meters, progress, opts, args) {
+  const fp = readJson(API_FETCH_PROGRESS, null);
+  if (!fp) throw new Error('no API scan found — run `node audit.mjs fetch-api` first');
+  if (!fp.finishedAt) log(`note: the API scan is not finished (cursor ${fp.cursor}); results reflect rows fetched so far`);
+  const shards = fp.shards; progress.shardIndex = progress.shardIndex ?? 0; progress.store = `api scan ${fp.from} .. ${fp.to} (${fp.rowsRead} rows)`;
+  const metersByShard = new Map(); for (const m of meters) { const s = shardOf(m.meterNo, shards); (metersByShard.get(s) || metersByShard.set(s, []).get(s)).push(m); }
+  const t0 = Date.now(); let doneThisRun = 0;
+  while (progress.shardIndex < shards && !stopRequested && doneThisRun < opts.limit) {
+    const s = progress.shardIndex; const byMeter = await loadShardRows(s); const list = metersByShard.get(s) || [];
+    const lines = []; let conflicts = 0, anomalies = 0, noRecords = 0, records = 0;
+    for (const m of list) { const rows = byMeter.get(m.meterNo) || []; const res = analyzeMeter(m, rows, opts); records += rows.length; if (res.status === 'conflict') conflicts++; if (res.status === 'no_records') noRecords++; if (res.anomalyTotal) anomalies++; lines.push(JSON.stringify(res)); }
+    const unknown = [...byMeter.keys()].filter((no) => !list.some((m) => m.meterNo === no)).length;
+    if (lines.length) appendFileSync(F.results, lines.join('\n') + '\n', 'utf8');
+    progress.shardIndex++; progress.processed += list.length; progress.nextIndex = progress.processed; progress.updatedAt = nowIso();
+    writeJsonAtomic(F.progress, progress);
+    doneThisRun += list.length;
+    log(`shard ${s + 1}/${shards}: ${list.length} meters, ${records} rows, ${conflicts} conflicts, ${anomalies} with anomalies, ${noRecords} without records${unknown ? `, ${unknown} device numbers not in the meter list` : ''} · ${(doneThisRun / Math.max(1, (Date.now() - t0) / 1000)).toFixed(0)} m/s`);
+  }
+  if (progress.shardIndex >= shards) { progress.finishedAt = nowIso(); writeJsonAtomic(F.progress, progress); log('analysis complete'); }
+  else log(stopRequested ? 'stopped by request — run again to continue' : 'stopped after --limit');
+}
+
 // ───────────────────────────────────────────────────────────── run (resumable loop)
 let stopRequested = false;
 function installSignalHandlers() {
@@ -689,7 +824,7 @@ async function cmdRun(args) {
   opts.limit = args.limit !== undefined ? Number(args.limit) : Infinity;
   opts.maxSamples = Number(args['max-samples']) || DEFAULTS.maxSamples;
   opts.maxTimeline = Number(args['max-timeline']) || DEFAULTS.maxTimeline;
-  if (!['mongo', 'mysql', 'api'].includes(opts.source)) throw new Error(`--source must be mongo, mysql or api (got ${opts.source})`);
+  if (!['jsonl', 'mongo', 'mysql', 'api'].includes(opts.source)) throw new Error(`--source must be jsonl, mongo, mysql or api (got ${opts.source})`);
   if (!['api', 'mysql', 'file'].includes(opts.meters)) throw new Error(`--meters must be api, mysql or file (got ${opts.meters})`);
   installSignalHandlers();
   log(`run: source=${opts.source} meters=${opts.meters} batch=${opts.batch}${Number.isFinite(opts.limit) ? ` limit=${opts.limit}` : ''}`);
@@ -711,13 +846,18 @@ async function cmdRun(args) {
   progress.metersTotal = meters.length; progress.source = opts.source; progress.metersSource = opts.meters; progress.schema = schema; progress.runs++;
   progress.updatedAt = nowIso(); delete progress.finishedAt;
   writeJsonAtomic(F.progress, progress);
-  if (progress.nextIndex >= meters.length) { log('all meters already analysed — nothing to do (use `reset` to start over)'); if (opts.build !== false) await cmdBuild(args); return; }
+  if (progress.finishedAt || progress.nextIndex >= meters.length) { log('all meters already analysed — nothing to do (use `reset` to start over)'); if (opts.build !== false) await cmdBuild(args); return; }
+  if (opts.source === 'jsonl') {
+    await runFromJsonl(meters, progress, opts, args);
+    if (opts.build !== false) await cmdBuild(args);
+    return;
+  }
   log(`resuming at index ${progress.nextIndex} (${progress.processed} meters already analysed)`);
 
   // 3. loop
   const db = opts.source === 'mysql' ? mysqlSession(schema) : null;
   const api = opts.source === 'api' ? apiSession() : null;
-  const mongo = opts.source === 'mongo' ? await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null }) : null;
+  const mongo = opts.source === 'mongo' ? await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null, sshArgs: args }) : null;
   const tables = db ? await resolveRegisterTables(db, { explicit: args.tables, from: args.from, to: args.to })
     : mongo ? await resolveRegisterCollections(mongo, { explicit: args.collections, from: args.from, to: args.to }) : null;
   progress.store = mongo ? `mongodb ${mongo.dbName}@${new URL(mongo.uri).host}` : db ? `mysql ${schema}` : 'mdc api';
@@ -759,6 +899,8 @@ async function cmdStatus() {
   const p = readJson(F.progress, null);
   const mp = readJson(F.metersProgress, null);
   if (!mp) console.log('meter list: not fetched yet'); else console.log(`meter list: ${mp.totalCount ?? '?'} meters (${mp.source || 'api'}${mp.done || (mp.totalPages && mp.lastPage >= mp.totalPages) ? ', complete' : `, page ${mp.lastPage}/${mp.totalPages}`})`);
+  const fp = readJson(API_FETCH_PROGRESS, null);
+  if (fp) console.log(`api scan: ${fp.rowsRead} rows in ${fp.requests} requests · ${fp.from} .. ${fp.to} · cursor ${fp.cursor} page ${fp.page}${fp.finishedAt ? ' · complete' : ' · not finished'}`);
   if (!p) { console.log('analysis: not started'); return; }
   console.log(`analysis: ${p.processed}/${p.metersTotal} meters (${(100 * p.processed / Math.max(1, p.metersTotal)).toFixed(1)}%) · source ${p.source} · schema ${p.schema || '-'} · runs ${p.runs}`);
   console.log(`started ${p.startedAt} · updated ${p.updatedAt}${p.finishedAt ? ` · finished ${p.finishedAt}` : ''}`);
@@ -768,8 +910,9 @@ async function cmdStatus() {
 }
 
 function cmdReset(args) {
-  if (!args.yes) { console.log('reset deletes state/, dashboard/ and output/. Run again with --yes (add --keep-meters to keep the meter list).'); return; }
+  if (!args.yes) { console.log('reset deletes state/, dashboard/ and output/. Run again with --yes (--keep-meters keeps the meter list, --keep-scan keeps the API scan).'); return; }
   for (const f of [F.progress, F.results, F.log]) if (existsSync(f)) unlinkSync(f);
+  if (!args['keep-scan']) rmSync(API_FETCH_DIR, { recursive: true, force: true }); else console.log('kept the API scan (state/api-fetch)');
   if (!args['keep-meters']) for (const f of [F.meters, F.metersProgress]) if (existsSync(f)) unlinkSync(f);
   for (const d of [DASH_DIR, OUTPUT_DIR]) rmSync(d, { recursive: true, force: true });
   console.log('state cleared');
@@ -1329,7 +1472,7 @@ async function cmdProbe(args) {
   // Mongo (records)
   let mongo = null;
   try {
-    mongo = await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null });
+    mongo = await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null, sshArgs: args });
     const cols = await resolveRegisterCollections(mongo, { explicit: args.collections, from: args.from, to: args.to });
     const latest = cols[cols.length - 1];
     const info = await mongoCollectionInfo(mongo, latest.name);
@@ -1352,7 +1495,7 @@ async function cmdProbe(args) {
 async function cmdDiscover(args, injected = null) {
   ensureDirs();
   const pattern = new RegExp(args.pattern ? String(args.pattern) : 'regist|auto', 'i');
-  const mongo = injected || await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null });
+  const mongo = injected || await mongoSession(args['mongo-uri'] || null, args['mongo-db'] || DEFAULT_MONGO_DB, { tunnel: args.tunnel || null, sshArgs: args });
   try {
     const dbs = (await mongo.client.db().admin().listDatabases()).databases;
     log(`databases (${dbs.length}): ${dbs.map((d) => `${d.name} (${(d.sizeOnDisk / 1048576).toFixed(0)} MB)`).join(', ')}`);
@@ -1409,28 +1552,45 @@ async function cmdDiscover(args, injected = null) {
  * Runs read-only commands on the cemig-ext-data SSH host (same plink + credentials as its RocketMQ job):
  * greps the SanPlat configs for mongo settings, lists live connections to :27017, and TCP-tests candidate hosts.
  */
-async function cmdSshScan(args) {
-  const { execFile } = await import('node:child_process');
+/** SSH settings: cemig-ext-data's .env, overridable with --ssh-host/--ssh-user/--ssh-pass or AUDIT_SSH_PASS. */
+async function sshSettings(args = {}) {
   const { config } = await loadExt();
   const plink = config.PLINK || 'C:\\Program Files\\PuTTY\\plink.exe';
   if (!existsSync(plink)) throw new Error(`plink not found at ${plink}`);
+  return { plink, host: args['ssh-host'] || config.SSH_HOST, user: args['ssh-user'] || config.SSH_USER, pass: args['ssh-pass'] || process.env.AUDIT_SSH_PASS || config.SSH_PASS };
+}
+/**
+ * EXACTLY the collector's invocation (cemig-ext-data/src/rocketmq/index.js): one cmd.exe command line,
+ * password in double quotes, remote command in double quotes — so what works for the RocketMQ job works here.
+ * Remote commands must therefore not contain double quotes.
+ */
+function plinkCommandLine(ssh, remote, extraFlags = '') {
+  return `"${ssh.plink}" -batch ${extraFlags}-pw "${ssh.pass}" ${ssh.user}@${ssh.host} "${remote}"`.replace(/\s+"$/, '"');
+}
+async function cmdSshScan(args) {
+  const { exec } = await import('node:child_process');
+  const ssh = await sshSettings(args);
   const extra = args.hosts ? String(args.hosts).split(',').map((s) => s.trim()).filter(Boolean) : [];
   const candidates = [...new Set([...DEFAULT_MONGO_HOSTS.map((h) => h.split(':')[0]), '10.30.104.30', '10.30.104.60', '10.30.104.66', '10.30.104.71', ...extra])];
-  const steps = [
-    ['mongo settings in config files', `grep -rhoE "mongo-(host|port|db|user|addr)[[:space:]]*=[^[:space:]]*|spring\\.data\\.mongodb\\.[a-z]+[[:space:]]*=[^[:space:]]*|mongodb://[^[:space:]\\"']+" /opt /home /app /data /usr/local /etc /srv 2>/dev/null | sort -u | head -60`],
-    ['mongo settings in running java processes', `ps -eo args 2>/dev/null | grep -oE "(-D[a-zA-Z.]*mongo[^ ]*|spring\\.profiles\\.active=[^ ]+|--spring\\.config\\.location=[^ ]+)" | sort -u | head -40`],
-    ['established connections to port 27017', `(ss -tn state established '( dport = :27017 )' 2>/dev/null || netstat -tn 2>/dev/null | grep ':27017') | awk '{print $NF" <- "$(NF-1)}' | sort -u | head -40`],
-    ['TCP reachability of candidate hosts from this box', candidates.map((h) => `(timeout 3 bash -c "</dev/tcp/${h}/27017" 2>/dev/null && echo "${h}:27017 OPEN" || echo "${h}:27017 closed")`).join('; ')],
-    ['hostname / addresses', 'hostname; hostname -I 2>/dev/null || ip -4 addr 2>/dev/null | grep -oE "inet [0-9.]+"'],
+  const steps = [   // single quotes only inside the remote commands (see plinkCommandLine)
+    ['who am i on the jump host', 'whoami; hostname; hostname -I 2>/dev/null'],
+    ['mongo settings in config files', `grep -rhoE 'mongo-(host|port|db|user|addr)[[:space:]]*=[^[:space:]]*|spring\\.data\\.mongodb\\.[a-z]+[[:space:]]*=[^[:space:]]*|mongodb://[^[:space:]]+' /opt /home /app /data /usr/local /etc /srv 2>/dev/null | sort -u | head -60`],
+    ['mongo settings in running java processes', `ps -eo args 2>/dev/null | grep -oE '(-D[a-zA-Z.]*mongo[^ ]*|spring\\.profiles\\.active=[^ ]+|--spring\\.config\\.location=[^ ]+)' | sort -u | head -40`],
+    ['established connections to port 27017', `(ss -tn state established '( dport = :27017 )' 2>/dev/null || netstat -tn 2>/dev/null | grep ':27017') | awk '{print $NF, $(NF-1)}' | sort -u | head -40`],
+    ['TCP reachability of candidate hosts from this box', candidates.map((h) => `(timeout 3 bash -c '</dev/tcp/${h}/27017' 2>/dev/null && echo '${h}:27017 OPEN' || echo '${h}:27017 closed')`).join('; ')],
   ];
-  log(`ssh-scan: ${config.SSH_USER}@${config.SSH_HOST} via ${plink}`);
+  log(`ssh-scan: ${ssh.user}@${ssh.host} via ${ssh.plink} (same command line as the cemig-ext-data RocketMQ job)`);
   for (const [title, cmd] of steps) {
     const out = await new Promise((resolve) => {
-      execFile(plink, ['-batch', '-pw', config.SSH_PASS, `${config.SSH_USER}@${config.SSH_HOST}`, cmd], { timeout: 90000, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
+      exec(plinkCommandLine(ssh, cmd), { timeout: 90000, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
         (err, stdout, stderr) => resolve((stdout || '') + (err ? `\n[ssh error] ${(stderr || err.message).trim().slice(0, 300)}` : '')));
     });
     const masked = out.replace(/(\/\/)[^@\/\s]+@/g, '$1***@').replace(/(pwd|password|passwd)(\s*=)[^\s]*/gi, '$1$2***').trim();
     log(`── ${title} ──\n${masked || '(nothing)'}`);
+    if (/Access denied|password was not accepted/i.test(out)) {
+      log(`ssh-scan: ${ssh.user}@${ssh.host} rejected the password from cemig-ext-data/.env (SSH_PASS). The collector's RocketMQ job on this machine uses the same value, so check whether that job still works; pass --ssh-user/--ssh-pass to try other credentials.`);
+      break;
+    }
   }
 }
 
@@ -1445,12 +1605,13 @@ async function main() {
     case 'status': await cmdStatus(); break;
     case 'reset': cmdReset(args); break;
     case 'probe': await cmdProbe(args); break;
+    case 'fetch-api': await cmdFetchApi(args); break;
     case 'discover': await cmdDiscover(args); break;
     case 'ssh-scan': await cmdSshScan(args); break;
     default: console.log('usage: node audit.mjs run|build|status|reset|probe|discover [options] (see header of this file)'); process.exit(2);
   }
 }
 
-export { cmdProbe, cmdDiscover, cmdSshScan, analyzeMeter, parseContent, summarize, resolveRegisterTables, fetchRecordsMysql, ObjectId, mongoSession, mongoCollectionInfo, mongoTimeBound, MONGO_PROJECTION, resolveRegisterCollections, fetchRecordsMongo, normalizeMongoRow, mongoMeterField, suffixWindow, DEFAULT_MONGO_URI, DEFAULT_MONGO_DB, BASE_TABLE, STATUS, ANOMALY_TYPES, mysqlSession, detectAmiSchema, readJsonl, readJson, writeJsonAtomic, localStamp, normTime, trimStr, nowIso, ensureDirs, STATE_DIR, OUTPUT_DIR, DEFAULT_AMI_SCHEMA };
+export { cmdProbe, cmdDiscover, cmdSshScan, cmdFetchApi, cmdRun, cmdBuild, runFromJsonl, loadShardRows, shardOf, normalizeApiRow, API_FETCH_DIR, API_FETCH_PROGRESS, SHARD_FILE, mongoCredentials, analyzeMeter, parseContent, summarize, resolveRegisterTables, fetchRecordsMysql, ObjectId, mongoSession, mongoCollectionInfo, mongoTimeBound, MONGO_PROJECTION, resolveRegisterCollections, fetchRecordsMongo, normalizeMongoRow, mongoMeterField, suffixWindow, DEFAULT_MONGO_URI, DEFAULT_MONGO_DB, BASE_TABLE, STATUS, ANOMALY_TYPES, mysqlSession, detectAmiSchema, readJsonl, readJson, writeJsonAtomic, localStamp, normTime, trimStr, nowIso, ensureDirs, STATE_DIR, OUTPUT_DIR, DEFAULT_AMI_SCHEMA };
 
 if (!process.env.AUDIT_NO_MAIN) main().catch((err) => { log(`FATAL: ${err.stack || err.message || err}`); process.exit(1); });
